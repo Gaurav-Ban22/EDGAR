@@ -267,11 +267,305 @@ class DeepPacejkaModelIAC(ModelBase):
         return x[:,-1,:3] + dxdt
 
 
+
+# =============================================================================
+# DeepBlue.AI V2 Models - Aerodynamic Downforce + Load Transfer + Friction Clip
+# =============================================================================
+# Changes from original DeepDynamicsModel:
+#   1. Df and Dr are NO LONGER predicted by the neural network.
+#      Instead, they are computed analytically as: D = mu * F_z
+#      where F_z is velocity-dependent (includes downforce + load transfer).
+#   2. F_z is no longer constant. It now equals:
+#      F_z,f = (l_r / L) * m * g + 0.5 * F_downforce
+#      F_z,r = (l_f / L) * m * g + 0.5 * F_downforce
+#      where F_downforce = 0.5 * rho * v_x^2 * A_wing * Cl
+#   3. F_rx (drivetrain longitudinal force) is clamped at mu * F_z,r
+#      to prevent exceeding the friction limit (no wheel spin).
+#   4. New VEHICLE_SPECS fields required in config:
+#      mu, rho, Cl, A_wing, h_cog
+# =============================================================================
+
+
+class DeepDynamicsModelV2(ModelBase):
+    """Modified Deep Dynamics for simulation data (Ts=0.02).
+    Removes Df/Dr from NN output, computes them from downforce physics."""
+
+    def __init__(self, param_dict, eval=False):
+
+        class GuardLayer(nn.Module):
+            def __init__(self, param_dict):
+                super().__init__()
+                guard_output = create_module(
+                    "DENSE",
+                    param_dict["MODEL"]["LAYERS"][-1]["OUT_FEATURES"],
+                    param_dict["MODEL"]["HORIZON"],
+                    len(param_dict["PARAMETERS"]),
+                    activation="Sigmoid"
+                )
+                self.guard_dense = guard_output[0]
+                self.guard_activation = guard_output[1]
+                self.coefficient_ranges = torch.zeros(
+                    len(param_dict["PARAMETERS"])
+                ).to(device)
+                self.coefficient_mins = torch.zeros(
+                    len(param_dict["PARAMETERS"])
+                ).to(device)
+                for i in range(len(param_dict["PARAMETERS"])):
+                    self.coefficient_ranges[i] = (
+                        param_dict["PARAMETERS"][i]["Max"]
+                        - param_dict["PARAMETERS"][i]["Min"]
+                    )
+                    self.coefficient_mins[i] = param_dict["PARAMETERS"][i]["Min"]
+
+            def forward(self, x):
+                guard_output = self.guard_dense(x)
+                guard_output = (
+                    self.guard_activation(guard_output)
+                    * self.coefficient_ranges
+                    + self.coefficient_mins
+                )
+                return guard_output
+
+        super().__init__(param_dict, [GuardLayer(param_dict)], eval)
+
+    def differential_equation(self, x, output, Ts=0.02):
+        sys_param_dict, _ = self.unpack_sys_params(output)
+        state_action_dict = self.unpack_state_actions(x)
+
+        steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
+        throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        yaw_rate = state_action_dict["YAW_RATE"]
+
+        # Vehicle geometry and constants from config
+        mass = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = lf + lr
+        mu = self.vehicle_specs["mu"]
+        rho = self.vehicle_specs["rho"]
+        Cl = self.vehicle_specs["Cl"]
+        A_wing = self.vehicle_specs["A_wing"]
+
+        # ---- Aerodynamic downforce (velocity-dependent) ----
+        # F_downforce = 0.5 * rho * vx^2 * A_wing * Cl
+        F_downforce = 0.5 * rho * (vx ** 2) * A_wing * Cl
+
+        # ---- Normal forces on front and rear axles ----
+        # Static weight split by lever arm ratio, plus downforce (split 50/50 for now)
+        Fz_f = (lr / L) * mass * 9.81 + 0.5 * F_downforce
+        Fz_r = (lf / L) * mass * 9.81 + 0.5 * F_downforce
+
+        # ---- Compute Df, Dr analytically (NOT from NN) ----
+        Df = mu * Fz_f
+        Dr = mu * Fz_r
+
+        # ---- Slip angles (identical to original) ----
+        alphaf = (
+            steering
+            - torch.atan2(lf * yaw_rate + vy, torch.abs(vx))
+            + sys_param_dict["Shf"]
+        )
+        alphar = (
+            torch.atan2(lr * yaw_rate - vy, torch.abs(vx))
+            + sys_param_dict["Shr"]
+        )
+
+        # ---- Drivetrain longitudinal force ----
+        Frx = (
+            (sys_param_dict["Cm1"] - sys_param_dict["Cm2"] * vx) * throttle
+            - sys_param_dict["Cr0"]
+            - sys_param_dict["Cr2"] * (vx ** 2)
+        )
+
+        # ---- Friction clipping: cap Frx at mu * Fz_r ----
+        Frx = torch.clamp(Frx, max=float(mu * Fz_r) if not isinstance(Fz_r, torch.Tensor) else None)
+        if isinstance(Fz_r, torch.Tensor):
+            Frx = torch.min(Frx, mu * Fz_r)
+
+        # ---- Pacejka lateral tire forces (using analytical Df, Dr) ----
+        Ffy = (
+            sys_param_dict["Svf"]
+            + Df * torch.sin(
+                sys_param_dict["Cf"] * torch.atan(
+                    sys_param_dict["Bf"] * alphaf
+                    - sys_param_dict["Ef"] * (
+                        sys_param_dict["Bf"] * alphaf
+                        - torch.atan(sys_param_dict["Bf"] * alphaf)
+                    )
+                )
+            )
+        )
+        Fry = (
+            sys_param_dict["Svr"]
+            + Dr * torch.sin(
+                sys_param_dict["Cr"] * torch.atan(
+                    sys_param_dict["Br"] * alphar
+                    - sys_param_dict["Er"] * (
+                        sys_param_dict["Br"] * alphar
+                        - torch.atan(sys_param_dict["Br"] * alphar)
+                    )
+                )
+            )
+        )
+
+        # ---- State derivatives (identical structure to original) ----
+        dxdt = torch.zeros(len(x), 3).to(device)
+        dxdt[:, 0] = (
+            1.0 / mass * (Frx - Ffy * torch.sin(steering))
+            + vy * yaw_rate
+        )
+        dxdt[:, 1] = (
+            1.0 / mass * (Fry + Ffy * torch.cos(steering))
+            - vx * yaw_rate
+        )
+        dxdt[:, 2] = (
+            1.0 / sys_param_dict["Iz"]
+            * (Ffy * lf * torch.cos(steering) - Fry * lr)
+        )
+        dxdt *= Ts
+        return x[:, -1, :3] + dxdt
+
+
+class DeepDynamicsModelIACV2(ModelBase):
+    """Modified Deep Dynamics for IAC real-world data (Ts=0.04).
+    Identical physics to DeepDynamicsModelV2, different default timestep."""
+
+    def __init__(self, param_dict, eval=False):
+
+        class GuardLayer(nn.Module):
+            def __init__(self, param_dict):
+                super().__init__()
+                guard_output = create_module(
+                    "DENSE",
+                    param_dict["MODEL"]["LAYERS"][-1]["OUT_FEATURES"],
+                    param_dict["MODEL"]["HORIZON"],
+                    len(param_dict["PARAMETERS"]),
+                    activation="Sigmoid"
+                )
+                self.guard_dense = guard_output[0]
+                self.guard_activation = guard_output[1]
+                self.coefficient_ranges = torch.zeros(
+                    len(param_dict["PARAMETERS"])
+                ).to(device)
+                self.coefficient_mins = torch.zeros(
+                    len(param_dict["PARAMETERS"])
+                ).to(device)
+                for i in range(len(param_dict["PARAMETERS"])):
+                    self.coefficient_ranges[i] = (
+                        param_dict["PARAMETERS"][i]["Max"]
+                        - param_dict["PARAMETERS"][i]["Min"]
+                    )
+                    self.coefficient_mins[i] = param_dict["PARAMETERS"][i]["Min"]
+
+            def forward(self, x):
+                guard_output = self.guard_dense(x)
+                guard_output = (
+                    self.guard_activation(guard_output)
+                    * self.coefficient_ranges
+                    + self.coefficient_mins
+                )
+                return guard_output
+
+        super().__init__(param_dict, [GuardLayer(param_dict)], eval)
+
+    def differential_equation(self, x, output, Ts=0.04):
+        sys_param_dict, _ = self.unpack_sys_params(output)
+        state_action_dict = self.unpack_state_actions(x)
+
+        steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
+        throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        yaw_rate = state_action_dict["YAW_RATE"]
+
+        mass = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = lf + lr
+        mu = self.vehicle_specs["mu"]
+        rho = self.vehicle_specs["rho"]
+        Cl = self.vehicle_specs["Cl"]
+        A_wing = self.vehicle_specs["A_wing"]
+
+        F_downforce = 0.5 * rho * (vx ** 2) * A_wing * Cl
+
+        Fz_f = (lr / L) * mass * 9.81 + 0.5 * F_downforce
+        Fz_r = (lf / L) * mass * 9.81 + 0.5 * F_downforce
+
+        Df = mu * Fz_f
+        Dr = mu * Fz_r
+
+        alphaf = (
+            steering
+            - torch.atan2(lf * yaw_rate + vy, torch.abs(vx))
+            + sys_param_dict["Shf"]
+        )
+        alphar = (
+            torch.atan2(lr * yaw_rate - vy, torch.abs(vx))
+            + sys_param_dict["Shr"]
+        )
+
+        Frx = (
+            (sys_param_dict["Cm1"] - sys_param_dict["Cm2"] * vx) * throttle
+            - sys_param_dict["Cr0"]
+            - sys_param_dict["Cr2"] * (vx ** 2)
+        )
+
+        Frx = torch.clamp(Frx, max=float(mu * Fz_r) if not isinstance(Fz_r, torch.Tensor) else None)
+        if isinstance(Fz_r, torch.Tensor):
+            Frx = torch.min(Frx, mu * Fz_r)
+
+        Ffy = (
+            sys_param_dict["Svf"]
+            + Df * torch.sin(
+                sys_param_dict["Cf"] * torch.atan(
+                    sys_param_dict["Bf"] * alphaf
+                    - sys_param_dict["Ef"] * (
+                        sys_param_dict["Bf"] * alphaf
+                        - torch.atan(sys_param_dict["Bf"] * alphaf)
+                    )
+                )
+            )
+        )
+        Fry = (
+            sys_param_dict["Svr"]
+            + Dr * torch.sin(
+                sys_param_dict["Cr"] * torch.atan(
+                    sys_param_dict["Br"] * alphar
+                    - sys_param_dict["Er"] * (
+                        sys_param_dict["Br"] * alphar
+                        - torch.atan(sys_param_dict["Br"] * alphar)
+                    )
+                )
+            )
+        )
+
+        dxdt = torch.zeros(len(x), 3).to(device)
+        dxdt[:, 0] = (
+            1.0 / mass * (Frx - Ffy * torch.sin(steering))
+            + vy * yaw_rate
+        )
+        dxdt[:, 1] = (
+            1.0 / mass * (Fry + Ffy * torch.cos(steering))
+            - vx * yaw_rate
+        )
+        dxdt[:, 2] = (
+            1.0 / sys_param_dict["Iz"]
+            * (Ffy * lf * torch.cos(steering) - Fry * lr)
+        )
+        dxdt *= Ts
+        return x[:, -1, :3] + dxdt
+
+
 string_to_model = {
     "DeepDynamics" : DeepDynamicsModel,
     "DeepPacejka" : DeepPacejkaModel,
     "DeepDynamicsIAC" : DeepDynamicsModelIAC,
-    "DeepPacejkaIAC" : DeepPacejkaModelIAC
+    "DeepPacejkaIAC" : DeepPacejkaModelIAC,
+    "DeepDynamicsV2" : DeepDynamicsModelV2,
+    "DeepDynamicsIACV2" : DeepDynamicsModelIACV2
 }
 
 string_to_dataset = {
@@ -279,5 +573,6 @@ string_to_dataset = {
     "DeepPacejka" : DeepPacejkaDataset,
     "DeepDynamicsIAC" : DeepDynamicsDataset,
     "DeepPacejkaIAC" : DeepPacejkaDataset,
-
+    "DeepDynamicsV2" : DeepDynamicsDataset,
+    "DeepDynamicsIACV2" : DeepDynamicsDataset,
 }
