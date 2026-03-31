@@ -45,7 +45,7 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
         wandb.watch(model, log='all')
     valid_loss_min = torch.inf
     model.train()
-    model.cuda()
+    model.to(device)
     weights = torch.tensor([1.0, 1.0, 1.0]).to(device)
     for i in range(model.epochs):
         train_steps = 0

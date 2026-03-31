@@ -13,6 +13,34 @@ if torch.cuda.is_available():
 else:
     device = torch.device("cpu")
 
+
+# ---------------------------------------------------------------------------
+# Physics helper functions (normal forces, aero, load transfer, traction)
+# ---------------------------------------------------------------------------
+
+def compute_aero_forces(vx, vy, rho, A_f, A_r, C_lf, C_lr):
+    v_sq = vx ** 2 + vy ** 2
+    F_aero_f = 0.5 * rho * v_sq * A_f * C_lf
+    F_aero_r = 0.5 * rho * v_sq * A_r * C_lr
+    return F_aero_f, F_aero_r
+
+
+def compute_load_transfer(h, L, m, a_x):
+    return (h / L) * m * a_x
+
+
+def compute_normal_forces(l_f, l_r, L, m, g, delta_W, F_aero_f, F_aero_r):
+    F_fz_static = (l_r / L) * m * g
+    F_rz_static = (l_f / L) * m * g
+    F_fz = F_fz_static - delta_W + F_aero_f
+    F_rz = F_rz_static + delta_W + F_aero_r
+    return F_fz, F_rz
+
+
+def compute_traction_limited_force(F_rx_desired, mu, F_rz):
+    return torch.minimum(F_rx_desired, mu * F_rz)
+
+
 class DatasetBase(torch.utils.data.Dataset):
     def __init__(self, features, labels, scaler=None):
         # features = features[1300:]
@@ -102,15 +130,42 @@ class ModelBase(nn.Module):
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
         throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
-        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"])) + sys_param_dict["Shf"]
-        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"])) + sys_param_dict["Shr"]
-        Frx = (sys_param_dict["Cm1"]-sys_param_dict["Cm2"]*state_action_dict["VX"])*throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"]*(state_action_dict["VX"]**2)
-        Ffy = sys_param_dict["Svf"] + sys_param_dict["Df"] * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
-        Fry = sys_param_dict["Svr"] +sys_param_dict["Dr"] * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        omega = state_action_dict["YAW_RATE"]
+        m = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        h = self.vehicle_specs["h"]
+
+        alphaf = steering - torch.atan2(lf * omega + vy, torch.abs(vx)) + sys_param_dict["Shf"]
+        alphar = torch.atan2(lr * omega - vy, torch.abs(vx)) + sys_param_dict["Shr"]
+
+        F_rx_desired = (sys_param_dict["Cm1"] - sys_param_dict["Cm2"] * vx) * throttle \
+                       - sys_param_dict["Cr0"] - sys_param_dict["Cr2"] * (vx ** 2)
+
+        a_x = F_rx_desired / m
+        delta_W = compute_load_transfer(h, L, m, a_x)
+        F_aero_f, F_aero_r = compute_aero_forces(
+            vx, vy, self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+        F_fz, F_rz = compute_normal_forces(lf, lr, L, m, self.vehicle_specs["g"], delta_W, F_aero_f, F_aero_r)
+
+        mu = self.vehicle_specs["mu"]
+        D_f = mu * F_fz
+        D_r = mu * F_rz
+
+        Ffy = sys_param_dict["Svf"] + D_f * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+        Fry = sys_param_dict["Svr"] + D_r * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+
+        Frx = compute_traction_limited_force(F_rx_desired, mu, F_rz)
+
         dxdt = torch.zeros(len(x), 3).to(device)
-        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
-        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
-        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
+        dxdt[:,0] = 1/m * (Frx - Ffy*torch.sin(steering)) + vy*omega
+        dxdt[:,1] = 1/m * (Fry + Ffy*torch.cos(steering)) - vx*omega
+        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*lf*torch.cos(steering) - Fry*lr)
         dxdt *= Ts
         return x[:,-1,:3] + dxdt
 
@@ -172,15 +227,42 @@ class DeepDynamicsModel(ModelBase):
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
         throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
-        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"])) + sys_param_dict["Shf"]
-        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"])) + sys_param_dict["Shr"]
-        Frx = (sys_param_dict["Cm1"]-sys_param_dict["Cm2"]*state_action_dict["VX"])*throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"]*(state_action_dict["VX"]**2)
-        Ffy = sys_param_dict["Svf"] + sys_param_dict["Df"] * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
-        Fry = sys_param_dict["Svr"] +sys_param_dict["Dr"] * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        omega = state_action_dict["YAW_RATE"]
+        m = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        h = self.vehicle_specs["h"]
+
+        alphaf = steering - torch.atan2(lf * omega + vy, torch.abs(vx)) + sys_param_dict["Shf"]
+        alphar = torch.atan2(lr * omega - vy, torch.abs(vx)) + sys_param_dict["Shr"]
+
+        F_rx_desired = (sys_param_dict["Cm1"] - sys_param_dict["Cm2"] * vx) * throttle \
+                       - sys_param_dict["Cr0"] - sys_param_dict["Cr2"] * (vx ** 2)
+
+        a_x = F_rx_desired / m
+        delta_W = compute_load_transfer(h, L, m, a_x)
+        F_aero_f, F_aero_r = compute_aero_forces(
+            vx, vy, self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+        F_fz, F_rz = compute_normal_forces(lf, lr, L, m, self.vehicle_specs["g"], delta_W, F_aero_f, F_aero_r)
+
+        mu = self.vehicle_specs["mu"]
+        D_f = mu * F_fz
+        D_r = mu * F_rz
+
+        Ffy = sys_param_dict["Svf"] + D_f * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+        Fry = sys_param_dict["Svr"] + D_r * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+
+        Frx = compute_traction_limited_force(F_rx_desired, mu, F_rz)
+
         dxdt = torch.zeros(len(x), 3).to(device)
-        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
-        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
-        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
+        dxdt[:,0] = 1/m * (Frx - Ffy*torch.sin(steering)) + vy*omega
+        dxdt[:,1] = 1/m * (Fry + Ffy*torch.cos(steering)) - vx*omega
+        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*lf*torch.cos(steering) - Fry*lr)
         dxdt *= Ts
         return x[:,-1,:3] + dxdt
 
@@ -194,17 +276,43 @@ class DeepPacejkaModel(ModelBase):
         sys_param_dict, _ = self.unpack_sys_params(output)
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
-        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"]))
-        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"]))
-        Ffy = sys_param_dict["Df"] * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
-        Fry = sys_param_dict["Dr"] * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        omega = state_action_dict["YAW_RATE"]
+        m = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        h = self.vehicle_specs["h"]
+
+        alphaf = steering - torch.atan2(lf * omega + vy, torch.abs(vx))
+        alphar = torch.atan2(lr * omega - vy, torch.abs(vx))
+
+        F_rx_predicted = sys_param_dict["Frx"]
+        a_x = F_rx_predicted / m
+        delta_W = compute_load_transfer(h, L, m, a_x)
+        F_aero_f, F_aero_r = compute_aero_forces(
+            vx, vy, self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+        F_fz, F_rz = compute_normal_forces(lf, lr, L, m, self.vehicle_specs["g"], delta_W, F_aero_f, F_aero_r)
+
+        mu = self.vehicle_specs["mu"]
+        D_f = mu * F_fz
+        D_r = mu * F_rz
+
+        Ffy = D_f * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+        Fry = D_r * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+
+        Frx = compute_traction_limited_force(F_rx_predicted, mu, F_rz)
+
         dxdt = torch.zeros(len(x), 3).to(device)
-        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (sys_param_dict["Frx"] - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
-        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
-        dxdt[:,2] = 1/self.vehicle_specs["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
+        dxdt[:,0] = 1/m * (Frx - Ffy*torch.sin(steering)) + vy*omega
+        dxdt[:,1] = 1/m * (Fry + Ffy*torch.cos(steering)) - vx*omega
+        dxdt[:,2] = 1/self.vehicle_specs["Iz"] * (Ffy*lf*torch.cos(steering) - Fry*lr)
         dxdt *= Ts
         return x[:,-1,:3] + dxdt
-    
+
 class DeepDynamicsModelIAC(ModelBase):
     def __init__(self, param_dict, eval=False):
 
@@ -233,18 +341,44 @@ class DeepDynamicsModelIAC(ModelBase):
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
         throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
-        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"])) + sys_param_dict["Shf"]
-        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"])) + sys_param_dict["Shr"]
-        Frx = (sys_param_dict["Cm1"]-sys_param_dict["Cm2"]*state_action_dict["VX"])*throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"]*(state_action_dict["VX"]**2)
-        Ffy = sys_param_dict["Svf"] + sys_param_dict["Df"] * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
-        Fry = sys_param_dict["Svr"] + sys_param_dict["Dr"] * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        omega = state_action_dict["YAW_RATE"]
+        m = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        h = self.vehicle_specs["h"]
+
+        alphaf = steering - torch.atan2(lf * omega + vy, torch.abs(vx)) + sys_param_dict["Shf"]
+        alphar = torch.atan2(lr * omega - vy, torch.abs(vx)) + sys_param_dict["Shr"]
+
+        F_rx_desired = (sys_param_dict["Cm1"] - sys_param_dict["Cm2"] * vx) * throttle \
+                       - sys_param_dict["Cr0"] - sys_param_dict["Cr2"] * (vx ** 2)
+
+        a_x = F_rx_desired / m
+        delta_W = compute_load_transfer(h, L, m, a_x)
+        F_aero_f, F_aero_r = compute_aero_forces(
+            vx, vy, self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+        F_fz, F_rz = compute_normal_forces(lf, lr, L, m, self.vehicle_specs["g"], delta_W, F_aero_f, F_aero_r)
+
+        mu = self.vehicle_specs["mu"]
+        D_f = mu * F_fz
+        D_r = mu * F_rz
+
+        Ffy = sys_param_dict["Svf"] + D_f * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+        Fry = sys_param_dict["Svr"] + D_r * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+
+        Frx = compute_traction_limited_force(F_rx_desired, mu, F_rz)
+
         dxdt = torch.zeros(len(x), 3).to(device)
-        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
-        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
-        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
+        dxdt[:,0] = 1/m * (Frx - Ffy*torch.sin(steering)) + vy*omega
+        dxdt[:,1] = 1/m * (Fry + Ffy*torch.cos(steering)) - vx*omega
+        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*lf*torch.cos(steering) - Fry*lr)
         dxdt *= Ts
         return x[:,-1,:3] + dxdt
-    
 
 class DeepPacejkaModelIAC(ModelBase):
     def __init__(self, param_dict, eval=False):
@@ -255,14 +389,40 @@ class DeepPacejkaModelIAC(ModelBase):
         sys_param_dict, _ = self.unpack_sys_params(output)
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
-        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"]))
-        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"]))
-        Ffy = sys_param_dict["Df"] * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
-        Fry = sys_param_dict["Dr"] * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        omega = state_action_dict["YAW_RATE"]
+        m = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        h = self.vehicle_specs["h"]
+
+        alphaf = steering - torch.atan2(lf * omega + vy, torch.abs(vx))
+        alphar = torch.atan2(lr * omega - vy, torch.abs(vx))
+
+        F_rx_predicted = sys_param_dict["Frx"]
+        a_x = F_rx_predicted / m
+        delta_W = compute_load_transfer(h, L, m, a_x)
+        F_aero_f, F_aero_r = compute_aero_forces(
+            vx, vy, self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+        F_fz, F_rz = compute_normal_forces(lf, lr, L, m, self.vehicle_specs["g"], delta_W, F_aero_f, F_aero_r)
+
+        mu = self.vehicle_specs["mu"]
+        D_f = mu * F_fz
+        D_r = mu * F_rz
+
+        Ffy = D_f * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+        Fry = D_r * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+
+        Frx = compute_traction_limited_force(F_rx_predicted, mu, F_rz)
+
         dxdt = torch.zeros(len(x), 3).to(device)
-        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (sys_param_dict["Frx"] - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
-        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
-        dxdt[:,2] = 1/self.vehicle_specs["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
+        dxdt[:,0] = 1/m * (Frx - Ffy*torch.sin(steering)) + vy*omega
+        dxdt[:,1] = 1/m * (Fry + Ffy*torch.cos(steering)) - vx*omega
+        dxdt[:,2] = 1/self.vehicle_specs["Iz"] * (Ffy*lf*torch.cos(steering) - Fry*lr)
         dxdt *= Ts
         return x[:,-1,:3] + dxdt
 

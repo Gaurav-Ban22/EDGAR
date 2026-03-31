@@ -7,13 +7,11 @@ ACTIONS:
   - STEERING_CMD
   - VREF
 PARAMETERS:
-  - Bf: 
-  - Cf: 
-  - Df: 
+  - Bf:
+  - Cf:
   - Ef:
-  - Br: 
-  - Cr: 
-  - Dr:
+  - Br:
+  - Cr:
   - Er:
   - Frx:
 VEHICLE_SPECS:
@@ -21,6 +19,15 @@ VEHICLE_SPECS:
   lr: 1.7328
   mass: 790.0
   Iz: 1000.0
+  h: 0.3
+  L: 2.9808
+  rho: 1.225
+  g: 9.81
+  A_f: 0.5
+  A_r: 0.7
+  C_lf: 1.5
+  C_lr: 2.0
+  mu: 1.5
 MODEL:
   NAME: DeepPacejkaIAC
   HORIZON: 16

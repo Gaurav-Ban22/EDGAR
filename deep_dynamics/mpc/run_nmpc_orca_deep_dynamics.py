@@ -164,6 +164,23 @@ for idt in range(n_steps-horizon):
 		for param in ddm.sys_params:
 			params[param] = ddm_output[idx]
 			idx += 1
+
+		vx_cur = x0[3]
+		vy_cur = x0[4]
+		vs = ddm.vehicle_specs
+		mu_val = vs["mu"]
+		F_rx_est = (params["Cm1"] - params["Cm2"] * vx_cur) * uprev[0] \
+				   - params["Cr0"] - params["Cr2"] * vx_cur**2
+		a_x_est = F_rx_est / params["mass"]
+		v_sq = vx_cur**2 + vy_cur**2
+		dW = (vs["h"] / vs["L"]) * params["mass"] * a_x_est
+		F_aero_f = 0.5 * vs["rho"] * v_sq * vs["A_f"] * vs["C_lf"]
+		F_aero_r = 0.5 * vs["rho"] * v_sq * vs["A_r"] * vs["C_lr"]
+		F_fz = (vs["lr"] / vs["L"]) * params["mass"] * vs["g"] - dW + F_aero_f
+		F_rz = (vs["lf"] / vs["L"]) * params["mass"] * vs["g"] + dW + F_aero_r
+		params["Df"] = mu_val * F_fz
+		params["Dr"] = mu_val * F_rz
+
 		dpm_model = Dynamic(**params)
 		nlp = setupNLP(horizon, Ts, COST_Q, COST_P, COST_R, params, dpm_model, track, track_cons=TRACK_CONS)
 

@@ -14,9 +14,6 @@ PARAMETERS:
   - Cf: 1.2
     Min: 0.5
     Max: 2.0
-  - Df: 0.192
-    Min: 0.1
-    Max: 0.9
   - Ef: -0.083
     Min: -2.0
     Max: 0.0
@@ -26,9 +23,6 @@ PARAMETERS:
   - Cr: 1.2691
     Min: 0.5
     Max: 2.0
-  - Dr: 0.1737
-    Min: 0.1
-    Max: 0.9
   - Er: -0.019
     Min: -2.0
     Max: 0.0
@@ -63,6 +57,15 @@ VEHICLE_SPECS:
   lf: 0.029
   lr: 0.033
   mass: 0.041
+  h: 0.01
+  L: 0.062
+  rho: 1.225
+  g: 9.81
+  A_f: 0.001
+  A_r: 0.001
+  C_lf: 0.0
+  C_lr: 0.0
+  mu: 0.8
 MODEL:
   NAME: DeepDynamics
   HORIZON: 5

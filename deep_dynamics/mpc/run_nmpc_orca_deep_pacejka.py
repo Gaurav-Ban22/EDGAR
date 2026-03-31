@@ -164,7 +164,6 @@ for idt in range(n_steps-horizon):
 	vrefs[idt] = track.v_raceline[projidx]
 	if idt > 15:
 		ddm_data = np.vstack((dstates[3:6, idt-ddm.horizon:idt], dstates[7, idt-ddm.horizon:idt], inputs[1,idt-ddm.horizon+1:idt+1], vrefs[idt-ddm.horizon:idt].T)).T
-		# ddm_data = np.array([*dstates[3:, idt-ddm.horizon:idt], *inputs[1,idt-ddm.horizon:idt]], dtype=np.float32)
 		ddm_data_norm = torch.from_numpy(np.expand_dims(ddm_scaler.transform(ddm_data), axis=0)).float().cuda()
 		ddm_data = torch.from_numpy(np.expand_dims(ddm_data, axis=0)).float().cuda()
 		if ddm.is_rnn:
@@ -181,6 +180,22 @@ for idt in range(n_steps-horizon):
 			else:
 				params[param] = np.abs(ddm_output[idx])
 			idx += 1
+
+		vx_cur = x0[3]
+		vy_cur = x0[4]
+		vs = ddm.vehicle_specs
+		mu_val = vs["mu"]
+		Frx_pred = params.get("Frx", 0.0)
+		a_x_est = Frx_pred / params["mass"]
+		v_sq = vx_cur**2 + vy_cur**2
+		dW = (vs["h"] / vs["L"]) * params["mass"] * a_x_est
+		F_aero_f = 0.5 * vs["rho"] * v_sq * vs["A_f"] * vs["C_lf"]
+		F_aero_r = 0.5 * vs["rho"] * v_sq * vs["A_r"] * vs["C_lr"]
+		F_fz = (vs["lr"] / vs["L"]) * params["mass"] * vs["g"] - dW + F_aero_f
+		F_rz = (vs["lf"] / vs["L"]) * params["mass"] * vs["g"] + dW + F_aero_r
+		params["Df"] = mu_val * F_fz
+		params["Dr"] = mu_val * F_rz
+
 		dpm_model = Dynamic(**params)
 		nlp = setupNLP(horizon, Ts, COST_Q, COST_P, COST_R, params, dpm_model, track, track_cons=TRACK_CONS)
 

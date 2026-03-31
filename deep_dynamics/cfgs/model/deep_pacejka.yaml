@@ -9,11 +9,9 @@ ACTIONS:
 PARAMETERS:
   - Bf: 2.579
   - Cf: 1.2
-  - Df: 0.192
   - Ef: 0.0
   - Br: 3.3852
   - Cr: 1.2691
-  - Dr: 0.1737
   - Er: 0.0
   - Frx:
 VEHICLE_SPECS:
@@ -21,6 +19,15 @@ VEHICLE_SPECS:
   lr: 0.033
   mass: 0.041
   Iz: 27.8e-6
+  h: 0.01
+  L: 0.062
+  rho: 1.225
+  g: 9.81
+  A_f: 0.001
+  A_r: 0.001
+  C_lf: 0.0
+  C_lr: 0.0
+  mu: 0.8
 MODEL:
   NAME: DeepPacejka
   HORIZON: 10
