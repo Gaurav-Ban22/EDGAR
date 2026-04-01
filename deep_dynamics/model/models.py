@@ -15,6 +15,33 @@ elif torch.backends.mps.is_available():
 else:
     device = torch.device("cpu")
 
+
+# ---------------------------------------------------------------------------
+# Physics helper functions (normal forces, aero, load transfer, traction)
+# ---------------------------------------------------------------------------
+
+def compute_aero_forces(vx, vy, rho, A_f, A_r, C_lf, C_lr):
+    v_sq = vx ** 2 + vy ** 2
+    F_aero_f = 0.5 * rho * v_sq * A_f * C_lf
+    F_aero_r = 0.5 * rho * v_sq * A_r * C_lr
+    return F_aero_f, F_aero_r
+
+
+def compute_load_transfer(h, L, m, a_x):
+    return (h / L) * m * a_x
+
+
+def compute_normal_forces(l_f, l_r, L, m, g, delta_W, F_aero_f, F_aero_r):
+    F_fz_static = (l_r / L) * m * g
+    F_rz_static = (l_f / L) * m * g
+    F_fz = F_fz_static - delta_W + F_aero_f
+    F_rz = F_rz_static + delta_W + F_aero_r
+    return F_fz, F_rz
+
+
+def compute_traction_limited_force(F_rx_desired, mu, F_rz):
+    return torch.minimum(F_rx_desired, mu * F_rz)
+
 class DatasetBase(torch.utils.data.Dataset):
     def __init__(self, features, labels, scaler=None):
         # features = features[1300:]
@@ -304,30 +331,30 @@ class DeepDynamicsPINN(nn.Module):
 
         self.feed_forward = nn.ModuleList(layers)
 
-        # Learnable Pacejka tire model parameters (17 total, optimized via backprop)
+        # Learnable Pacejka tire model parameters (15 total, optimized via backprop)
+        # NOTE: Df and Dr are NO LONGER learnable — they are computed analytically
+        #       as D = mu * Fz, where Fz includes aero downforce + load transfer.
         physics_params = param_dict.get("PHYSICS_PARAMS", {})
-        # Pacejka lateral force params
+        # Pacejka lateral force shape params (no Df/Dr — those are analytical now)
         self.Bf = nn.Parameter(torch.tensor(float(physics_params.get("Bf", 5.579))))
         self.Cf = nn.Parameter(torch.tensor(float(physics_params.get("Cf", 1.2))))
-        self.Df = nn.Parameter(torch.tensor(float(physics_params.get("Df", 0.192))))
         self.Ef = nn.Parameter(torch.tensor(float(physics_params.get("Ef", -0.083))))
         self.Br = nn.Parameter(torch.tensor(float(physics_params.get("Br", 5.3852))))
         self.Cr = nn.Parameter(torch.tensor(float(physics_params.get("Cr", 1.2691))))
-        self.Dr = nn.Parameter(torch.tensor(float(physics_params.get("Dr", 0.1737))))
         self.Er = nn.Parameter(torch.tensor(float(physics_params.get("Er", -0.019))))
         # Longitudinal force params
         self.Cm1 = nn.Parameter(torch.tensor(float(physics_params.get("Cm1", 0.287))))
         self.Cm2 = nn.Parameter(torch.tensor(float(physics_params.get("Cm2", 0.0545))))
         self.Cr0 = nn.Parameter(torch.tensor(float(physics_params.get("Cr0", 0.0518))))
         self.Cr2 = nn.Parameter(torch.tensor(float(physics_params.get("Cr2", 0.00035))))
-        # Moment of inertia
-        self.Iz = nn.Parameter(torch.tensor(float(physics_params.get("Iz", 27.8e-6))))
         # Slip angle shift params
         self.Shf = nn.Parameter(torch.tensor(float(physics_params.get("Shf", -0.0013))))
         self.Shr = nn.Parameter(torch.tensor(float(physics_params.get("Shr", -0.00376))))
         # Vertical force shift params
         self.Svf = nn.Parameter(torch.tensor(float(physics_params.get("Svf", 0.00043))))
         self.Svr = nn.Parameter(torch.tensor(float(physics_params.get("Svr", 0.00091))))
+        # Iz from learnable param (fallback) or vehicle_specs (preferred)
+        self.Iz = nn.Parameter(torch.tensor(float(physics_params.get("Iz", self.vehicle_specs.get("Iz", 27.8e-6)))))
 
         # Loss and optimizer
         if eval:
@@ -359,10 +386,28 @@ class DeepDynamicsPINN(nn.Module):
         predicted state derivatives and the derivatives computed by the
         governing differential equations (Pacejka tire model + bicycle
         dynamics), i.e.  loss = || dstate/dt_NN - f(x, u, theta) ||^2
+
+        Enhanced with modifiedmodelpacejka physics:
+          - Longitudinal load transfer
+          - Per-axle aerodynamic downforce
+          - Analytical Df/Dr = mu * Fz (not learned)
+          - Traction-limited longitudinal force
         """
         state_action_dict = self._unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
         throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
+        vx = state_action_dict["VX"]
+        vy = state_action_dict["VY"]
+        omega = state_action_dict["YAW_RATE"]
+
+        # Vehicle geometry from config
+        mass = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        h = self.vehicle_specs["h"]
+        mu = self.vehicle_specs["mu"]
+        g = self.vehicle_specs["g"]
 
         # --- NN-predicted state derivatives ---
         nn_dstate_dt = (predictions - x[:, -1, :3]) / Ts
@@ -370,36 +415,49 @@ class DeepDynamicsPINN(nn.Module):
         # --- Physics-predicted state derivatives (governing ODEs) ---
 
         # Slip angles with shift parameters
-        alphaf = steering - torch.atan2(
-            self.vehicle_specs["lf"] * state_action_dict["YAW_RATE"] + state_action_dict["VY"],
-            torch.abs(state_action_dict["VX"])
-        ) + self.Shf
-        alphar = torch.atan2(
-            self.vehicle_specs["lr"] * state_action_dict["YAW_RATE"] - state_action_dict["VY"],
-            torch.abs(state_action_dict["VX"])
-        ) + self.Shr
+        alphaf = steering - torch.atan2(lf * omega + vy, torch.abs(vx)) + self.Shf
+        alphar = torch.atan2(lr * omega - vy, torch.abs(vx)) + self.Shr
 
-        # Longitudinal force (full model with throttle)
-        Frx = ((self.Cm1 - self.Cm2 * state_action_dict["VX"]) * throttle
-               - self.Cr0 - self.Cr2 * (state_action_dict["VX"] ** 2))
+        # Desired longitudinal force from drivetrain model
+        F_rx_desired = ((self.Cm1 - self.Cm2 * vx) * throttle
+                        - self.Cr0 - self.Cr2 * (vx ** 2))
+
+        # Longitudinal load transfer: delta_W = (h / L) * m * a_x
+        a_x = F_rx_desired / mass
+        delta_W = compute_load_transfer(h, L, mass, a_x)
+
+        # Per-axle aerodynamic downforce
+        F_aero_f, F_aero_r = compute_aero_forces(
+            vx, vy, self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+
+        # Normal forces (static + load transfer + aero)
+        F_fz, F_rz = compute_normal_forces(lf, lr, L, mass, g, delta_W, F_aero_f, F_aero_r)
+
+        # Analytical Df, Dr from normal forces (NOT learned by NN)
+        Df = mu * F_fz
+        Dr = mu * F_rz
+
+        # Traction-limited longitudinal force
+        Frx = compute_traction_limited_force(F_rx_desired, mu, F_rz)
 
         # Pacejka magic formula for lateral tire forces (with vertical shifts)
-        Ffy = self.Svf + self.Df * torch.sin(self.Cf * torch.atan(
+        Ffy = self.Svf + Df * torch.sin(self.Cf * torch.atan(
             self.Bf * alphaf - self.Ef * (self.Bf * alphaf - torch.atan(self.Bf * alphaf))
         ))
-        Fry = self.Svr + self.Dr * torch.sin(self.Cr * torch.atan(
+        Fry = self.Svr + Dr * torch.sin(self.Cr * torch.atan(
             self.Br * alphar - self.Er * (self.Br * alphar - torch.atan(self.Br * alphar))
         ))
 
         # Bicycle model dynamics (governing ODEs)
         physics_dstate_dt = torch.zeros(len(x), 3).to(x.device)
-        physics_dstate_dt[:, 0] = (1 / self.vehicle_specs["mass"] * (Frx - Ffy * torch.sin(steering))
-                                    + state_action_dict["VY"] * state_action_dict["YAW_RATE"])
-        physics_dstate_dt[:, 1] = (1 / self.vehicle_specs["mass"] * (Fry + Ffy * torch.cos(steering))
-                                    - state_action_dict["VX"] * state_action_dict["YAW_RATE"])
+        physics_dstate_dt[:, 0] = (1 / mass * (Frx - Ffy * torch.sin(steering))
+                                    + vy * omega)
+        physics_dstate_dt[:, 1] = (1 / mass * (Fry + Ffy * torch.cos(steering))
+                                    - vx * omega)
         physics_dstate_dt[:, 2] = (1 / self.Iz * (
-            Ffy * self.vehicle_specs["lf"] * torch.cos(steering)
-            - Fry * self.vehicle_specs["lr"]
+            Ffy * lf * torch.cos(steering) - Fry * lr
         ))
 
         # ODE residual: || dstate/dt_NN - f(x, u, theta) ||^2
