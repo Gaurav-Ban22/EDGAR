@@ -22,11 +22,11 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 
-from deep_dynamics.rl.track import Track
+from deep_dynamics.rl.environment.track import Track
 
 
 def _tracks_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "visualize" / "tracks"
+    return Path(__file__).resolve().parent.parent.parent / "visualize" / "tracks"
 
 
 def _demo_one(track: Track, output_dir: Path, plot: bool) -> None:

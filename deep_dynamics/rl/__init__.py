@@ -1,1 +1,1 @@
-from deep_dynamics.rl.track import Track
+from deep_dynamics.rl.environment.track import Track
