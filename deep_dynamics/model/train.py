@@ -1,5 +1,8 @@
 import wandb
-from ray import train as raytrain
+try:
+    from ray import train as raytrain
+except ImportError:
+    raytrain = None
 from deep_dynamics.model.models import DeepDynamicsModel, DeepDynamicsDataset, DeepPacejkaModel
 from deep_dynamics.model.models import string_to_model, string_to_dataset
 import torch
@@ -10,6 +13,8 @@ import pickle
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
 else:
     device = torch.device("cpu")
 
@@ -45,7 +50,7 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
         wandb.watch(model, log='all')
     valid_loss_min = torch.inf
     model.train()
-    model.cuda()
+    model.to(device)
     weights = torch.tensor([1.0, 1.0, 1.0]).to(device)
     for i in range(model.epochs):
         train_steps = 0
@@ -62,6 +67,10 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
             else:
                 output, _, _ = model(inputs, norm_inputs)
             loss = model.weighted_mse_loss(output, labels, weights).mean()
+            # Add physics residual loss for PINN models
+            if hasattr(model, 'physics_residual'):
+                physics_loss = model.physics_residual(inputs, output)
+                loss = loss + model.physics_weight * physics_loss
             train_loss_accum += loss.item()
             train_steps += 1
             loss.backward()
@@ -79,6 +88,10 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
             else:
                 out, _, _ = model(inp, norm_inp)
             val_loss = model.weighted_mse_loss(out, lab, weights).mean()
+            # Add physics residual loss for PINN models during validation
+            if hasattr(model, 'physics_residual'):
+                val_physics_loss = model.physics_residual(inp, out)
+                val_loss = val_loss + model.physics_weight * val_physics_loss
             val_loss_accum += val_loss.item()
             val_steps += 1
         mean_train_loss = train_loss_accum / train_steps
@@ -86,6 +99,8 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
         if log_wandb:
             wandb.log({"train_loss": mean_train_loss })
             wandb.log({"val_loss": mean_val_loss})
+            if hasattr(model, 'physics_residual'):
+                wandb.log({"physics_loss_weight": model.physics_weight})
         if mean_val_loss < valid_loss_min:
             torch.save(model.state_dict(), "%s/epoch_%s.pth" % (output_dir, i+1))
             print('Validation loss decreased ({:.6f} --> {:.6f}).  Saving model ...'.format(valid_loss_min,mean_val_loss))
@@ -109,7 +124,8 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
         if np.isnan(mean_val_loss):
             break    
         model.train()
-    wandb.finish()
+    if log_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     import argparse, argcomplete

@@ -10,6 +10,8 @@ from abc import abstractmethod
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
 else:
     device = torch.device("cpu")
 
@@ -267,11 +269,169 @@ class DeepPacejkaModelIAC(ModelBase):
         return x[:,-1,:3] + dxdt
 
 
+class DeepDynamicsPINN(nn.Module):
+    """Physics-Informed Neural Network variant of DeepDynamicsModel.
+
+    Instead of using a GuardLayer + physics equations structurally in the
+    forward pass, the NN directly predicts state changes (dVX, dVY, dYAW_RATE).
+    Physics compliance is enforced via a residual loss term using learnable
+    Pacejka tire model parameters with full longitudinal force modeling.
+    """
+    def __init__(self, param_dict, eval=False):
+        super().__init__()
+        self.param_dict = param_dict
+        self.batch_size = param_dict["MODEL"]["OPTIMIZATION"]["BATCH_SIZE"]
+        self.horizon = param_dict["MODEL"]["HORIZON"]
+        self.epochs = param_dict["MODEL"]["OPTIMIZATION"]["NUM_EPOCHS"]
+        self.state = list(param_dict["STATE"])
+        self.actions = list(param_dict["ACTIONS"])
+        self.vehicle_specs = param_dict["VEHICLE_SPECS"]
+        self.physics_weight = param_dict["MODEL"]["OPTIMIZATION"].get("PHYSICS_LOSS_WEIGHT", 0.1)
+
+        # Build the shared network layers (GRU + Dense hidden layers)
+        layers = build_network(param_dict)
+        if param_dict["MODEL"]["LAYERS"][0].get("LAYERS"):
+            self.is_rnn = True
+            self.rnn_n_layers = param_dict["MODEL"]["LAYERS"][0].get("LAYERS")
+            self.rnn_hiden_dim = param_dict["MODEL"]["HORIZON"]
+            layers.insert(1, nn.Flatten())
+        else:
+            self.is_rnn = False
+
+        # Final output layer: predict 3 state deltas (dVX, dVY, dYAW_RATE)
+        last_hidden_size = param_dict["MODEL"]["LAYERS"][-1]["OUT_FEATURES"]
+        layers.append(nn.Linear(last_hidden_size, 3))
+
+        self.feed_forward = nn.ModuleList(layers)
+
+        # Learnable Pacejka tire model parameters (17 total, optimized via backprop)
+        physics_params = param_dict.get("PHYSICS_PARAMS", {})
+        # Pacejka lateral force params
+        self.Bf = nn.Parameter(torch.tensor(float(physics_params.get("Bf", 5.579))))
+        self.Cf = nn.Parameter(torch.tensor(float(physics_params.get("Cf", 1.2))))
+        self.Df = nn.Parameter(torch.tensor(float(physics_params.get("Df", 0.192))))
+        self.Ef = nn.Parameter(torch.tensor(float(physics_params.get("Ef", -0.083))))
+        self.Br = nn.Parameter(torch.tensor(float(physics_params.get("Br", 5.3852))))
+        self.Cr = nn.Parameter(torch.tensor(float(physics_params.get("Cr", 1.2691))))
+        self.Dr = nn.Parameter(torch.tensor(float(physics_params.get("Dr", 0.1737))))
+        self.Er = nn.Parameter(torch.tensor(float(physics_params.get("Er", -0.019))))
+        # Longitudinal force params
+        self.Cm1 = nn.Parameter(torch.tensor(float(physics_params.get("Cm1", 0.287))))
+        self.Cm2 = nn.Parameter(torch.tensor(float(physics_params.get("Cm2", 0.0545))))
+        self.Cr0 = nn.Parameter(torch.tensor(float(physics_params.get("Cr0", 0.0518))))
+        self.Cr2 = nn.Parameter(torch.tensor(float(physics_params.get("Cr2", 0.00035))))
+        # Moment of inertia
+        self.Iz = nn.Parameter(torch.tensor(float(physics_params.get("Iz", 27.8e-6))))
+        # Slip angle shift params
+        self.Shf = nn.Parameter(torch.tensor(float(physics_params.get("Shf", -0.0013))))
+        self.Shr = nn.Parameter(torch.tensor(float(physics_params.get("Shr", -0.00376))))
+        # Vertical force shift params
+        self.Svf = nn.Parameter(torch.tensor(float(physics_params.get("Svf", 0.00043))))
+        self.Svr = nn.Parameter(torch.tensor(float(physics_params.get("Svr", 0.00091))))
+
+        # Loss and optimizer
+        if eval:
+            self.loss_function = string_to_torch[param_dict["MODEL"]["OPTIMIZATION"]["LOSS"]](reduction='none')
+        else:
+            self.loss_function = string_to_torch[param_dict["MODEL"]["OPTIMIZATION"]["LOSS"]]()
+        self.optimizer = string_to_torch[param_dict["MODEL"]["OPTIMIZATION"]["OPTIMIZER"]](self.parameters(), lr=param_dict["MODEL"]["OPTIMIZATION"]["LR"])
+
+    def forward(self, x, x_norm, h0=None, Ts=0.02):
+        for i in range(len(self.feed_forward)):
+            if i == 0:
+                if isinstance(self.feed_forward[i], torch.nn.RNNBase):
+                    ff, h0 = self.feed_forward[0](x_norm, h0)
+                else:
+                    ff = self.feed_forward[i](torch.reshape(x_norm, (len(x), -1)))
+            else:
+                if isinstance(self.feed_forward[i], torch.nn.RNNBase):
+                    ff, h0 = self.feed_forward[0](ff, h0)
+                else:
+                    ff = self.feed_forward[i](ff)
+        # ff is the raw NN output: 3 state deltas
+        predictions = x[:, -1, :3] + ff * Ts
+        return predictions, h0, ff
+
+    def physics_residual(self, x, predictions, Ts=0.02):
+        """Compute the PINN ODE residual loss.
+
+        Standard PINN formulation: penalizes the residual between the NN's
+        predicted state derivatives and the derivatives computed by the
+        governing differential equations (Pacejka tire model + bicycle
+        dynamics), i.e.  loss = || dstate/dt_NN - f(x, u, theta) ||^2
+        """
+        state_action_dict = self._unpack_state_actions(x)
+        steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
+        throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
+
+        # --- NN-predicted state derivatives ---
+        nn_dstate_dt = (predictions - x[:, -1, :3]) / Ts
+
+        # --- Physics-predicted state derivatives (governing ODEs) ---
+
+        # Slip angles with shift parameters
+        alphaf = steering - torch.atan2(
+            self.vehicle_specs["lf"] * state_action_dict["YAW_RATE"] + state_action_dict["VY"],
+            torch.abs(state_action_dict["VX"])
+        ) + self.Shf
+        alphar = torch.atan2(
+            self.vehicle_specs["lr"] * state_action_dict["YAW_RATE"] - state_action_dict["VY"],
+            torch.abs(state_action_dict["VX"])
+        ) + self.Shr
+
+        # Longitudinal force (full model with throttle)
+        Frx = ((self.Cm1 - self.Cm2 * state_action_dict["VX"]) * throttle
+               - self.Cr0 - self.Cr2 * (state_action_dict["VX"] ** 2))
+
+        # Pacejka magic formula for lateral tire forces (with vertical shifts)
+        Ffy = self.Svf + self.Df * torch.sin(self.Cf * torch.atan(
+            self.Bf * alphaf - self.Ef * (self.Bf * alphaf - torch.atan(self.Bf * alphaf))
+        ))
+        Fry = self.Svr + self.Dr * torch.sin(self.Cr * torch.atan(
+            self.Br * alphar - self.Er * (self.Br * alphar - torch.atan(self.Br * alphar))
+        ))
+
+        # Bicycle model dynamics (governing ODEs)
+        physics_dstate_dt = torch.zeros(len(x), 3).to(x.device)
+        physics_dstate_dt[:, 0] = (1 / self.vehicle_specs["mass"] * (Frx - Ffy * torch.sin(steering))
+                                    + state_action_dict["VY"] * state_action_dict["YAW_RATE"])
+        physics_dstate_dt[:, 1] = (1 / self.vehicle_specs["mass"] * (Fry + Ffy * torch.cos(steering))
+                                    - state_action_dict["VX"] * state_action_dict["YAW_RATE"])
+        physics_dstate_dt[:, 2] = (1 / self.Iz * (
+            Ffy * self.vehicle_specs["lf"] * torch.cos(steering)
+            - Fry * self.vehicle_specs["lr"]
+        ))
+
+        # ODE residual: || dstate/dt_NN - f(x, u, theta) ||^2
+        return torch.nn.functional.mse_loss(nn_dstate_dt, physics_dstate_dt)
+
+    def _unpack_state_actions(self, x):
+        """Unpack state and action variables from input tensor."""
+        state_action_dict = dict()
+        global_index = 0
+        for i in range(len(self.state)):
+            state_action_dict[self.state[i]] = x[:, -1, global_index]
+            global_index += 1
+        for i in range(len(self.actions)):
+            state_action_dict[self.actions[i]] = x[:, -1, global_index]
+            global_index += 1
+        return state_action_dict
+
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters()).data
+        hidden = weight.new(self.rnn_n_layers, batch_size, self.rnn_hiden_dim).zero_().to(weight.device)
+        return hidden
+
+    def weighted_mse_loss(self, input, target, weight):
+        return (weight * (input - target) ** 2)
+
+
 string_to_model = {
     "DeepDynamics" : DeepDynamicsModel,
     "DeepPacejka" : DeepPacejkaModel,
     "DeepDynamicsIAC" : DeepDynamicsModelIAC,
-    "DeepPacejkaIAC" : DeepPacejkaModelIAC
+    "DeepPacejkaIAC" : DeepPacejkaModelIAC,
+    "DeepDynamicsPINN" : DeepDynamicsPINN
 }
 
 string_to_dataset = {
@@ -279,5 +439,5 @@ string_to_dataset = {
     "DeepPacejka" : DeepPacejkaDataset,
     "DeepDynamicsIAC" : DeepDynamicsDataset,
     "DeepPacejkaIAC" : DeepPacejkaDataset,
-
+    "DeepDynamicsPINN" : DeepDynamicsDataset
 }
