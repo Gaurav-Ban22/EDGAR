@@ -65,6 +65,7 @@ class ModelBase(nn.Module):
         else:
             self.is_rnn = False
         self.horizon = self.param_dict["MODEL"]["HORIZON"]
+        self.timestep = float(self.param_dict["MODEL"].get("TIMESTEP", 0.02))
         layers.extend(output_module)
         self.feed_forward = nn.ModuleList(layers)
         if eval:
@@ -97,7 +98,7 @@ class ModelBase(nn.Module):
         o = self.differential_equation(x, ff)
         return o, h0, ff
     
-    def test_sys_params(self, x, Ts=0.02):
+    def test_sys_params(self, x):
         _, sys_param_dict = self.unpack_sys_params(torch.zeros((1, len(self.sys_params))))
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
@@ -111,7 +112,7 @@ class ModelBase(nn.Module):
         dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
         dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
         dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
-        dxdt *= Ts
+        dxdt *= self.timestep
         return x[:,-1,:3] + dxdt
 
 
@@ -167,7 +168,7 @@ class DeepDynamicsModel(ModelBase):
         
         super().__init__(param_dict, [GuardLayer(param_dict)], eval)
 
-    def differential_equation(self, x, output, Ts=0.02):
+    def differential_equation(self, x, output):
         sys_param_dict, _ = self.unpack_sys_params(output)
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
@@ -181,7 +182,7 @@ class DeepDynamicsModel(ModelBase):
         dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
         dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
         dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
-        dxdt *= Ts
+        dxdt *= self.timestep
         return x[:,-1,:3] + dxdt
 
 
@@ -190,7 +191,7 @@ class DeepPacejkaModel(ModelBase):
         output_module = create_module("DENSE", param_dict["MODEL"]["LAYERS"][-1]["OUT_FEATURES"], param_dict["MODEL"]["HORIZON"], len(param_dict["PARAMETERS"]), activation=None)
         super().__init__(param_dict, output_module, eval)
 
-    def differential_equation(self, x, output, Ts=0.02):
+    def differential_equation(self, x, output):
         sys_param_dict, _ = self.unpack_sys_params(output)
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
@@ -202,7 +203,7 @@ class DeepPacejkaModel(ModelBase):
         dxdt[:,0] = 1/self.vehicle_specs["mass"] * (sys_param_dict["Frx"] - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
         dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
         dxdt[:,2] = 1/self.vehicle_specs["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
-        dxdt *= Ts
+        dxdt *= self.timestep
         return x[:,-1,:3] + dxdt
     
 class DeepDynamicsModelIAC(ModelBase):
@@ -228,7 +229,7 @@ class DeepDynamicsModelIAC(ModelBase):
         
         super().__init__(param_dict, [GuardLayer(param_dict)], eval)
 
-    def differential_equation(self, x, output, Ts=0.04):
+    def differential_equation(self, x, output):
         sys_param_dict, _ = self.unpack_sys_params(output)
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
@@ -242,7 +243,7 @@ class DeepDynamicsModelIAC(ModelBase):
         dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
         dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
         dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
-        dxdt *= Ts
+        dxdt *= self.timestep
         return x[:,-1,:3] + dxdt
     
 
@@ -251,7 +252,7 @@ class DeepPacejkaModelIAC(ModelBase):
         output_module = create_module("DENSE", param_dict["MODEL"]["LAYERS"][-1]["OUT_FEATURES"], param_dict["MODEL"]["HORIZON"], len(param_dict["PARAMETERS"]), activation=None)
         super().__init__(param_dict, output_module, eval)
 
-    def differential_equation(self, x, output, Ts=0.04):
+    def differential_equation(self, x, output):
         sys_param_dict, _ = self.unpack_sys_params(output)
         state_action_dict = self.unpack_state_actions(x)
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
@@ -263,7 +264,7 @@ class DeepPacejkaModelIAC(ModelBase):
         dxdt[:,0] = 1/self.vehicle_specs["mass"] * (sys_param_dict["Frx"] - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
         dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
         dxdt[:,2] = 1/self.vehicle_specs["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
-        dxdt *= Ts
+        dxdt *= self.timestep
         return x[:,-1,:3] + dxdt
 
 

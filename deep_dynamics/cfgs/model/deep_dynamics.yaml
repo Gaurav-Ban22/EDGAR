@@ -66,6 +66,7 @@ VEHICLE_SPECS:
 MODEL:
   NAME: DeepDynamics
   HORIZON: 5
+  TIMESTEP: 0.04
   LAYERS:
     - GRU:
       OUT_FEATURES: 25

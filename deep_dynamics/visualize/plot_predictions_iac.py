@@ -12,7 +12,6 @@ from tqdm import tqdm
 from deep_dynamics.model.models import string_to_model, string_to_dataset
 from deep_dynamics.tools.csv_parser import write_dataset
 
-Ts = 0.04
 HORIZON = 15
 
 #####################################################################
@@ -49,6 +48,7 @@ ddm = string_to_model[param_dict["MODEL"]["NAME"]](param_dict, eval=True)
 ddm.to(device)
 ddm.eval()
 ddm.load_state_dict(torch.load(state_dict))
+Ts = float(ddm.timestep)
 features, labels, poses = write_dataset(dataset_file, ddm.horizon, save=False)
 ddm_dataset = string_to_dataset[param_dict["MODEL"]["NAME"]](features[:3000], labels[:3000], ddm_scaler)
 ddm_predictions = np.zeros((len(ddm_dataset)-HORIZON, 6, HORIZON+1))
@@ -78,7 +78,7 @@ for inputs, labels, norm_inputs in tqdm(ddm_data_loader, total=len(ddm_predictio
 		ddm_predictions[idt,1,idh+1] = ddm_predictions[idt,1,idh] + (ddm_predictions[idt,3,idh]*np.sin(ddm_predictions[idt,2,idh]) + ddm_predictions[idt,4,idh]*np.cos(ddm_predictions[idt,2,idh])) * Ts
 		ddm_predictions[idt,2,idh+1] = ddm_predictions[idt,2,idh] + ddm_predictions[idt,5,idh] * Ts
 		ddm_input = np.array([*ddm_predictions[idt,3:,idh], *features[idt+idh, -1, 3:]]).reshape(1,1,-1)
-		dxdt = ddm.differential_equation(torch.from_numpy(ddm_input).to(device), ddm_output, Ts) 
+		dxdt = ddm.differential_equation(torch.from_numpy(ddm_input).to(device), ddm_output) 
 		dxdt = dxdt.cpu().detach().numpy()[-1]
 		ddm_predictions[idt,3,idh+1] = dxdt[0]
 		ddm_predictions[idt,4,idh+1] = dxdt[1]
@@ -103,6 +103,7 @@ with open(os.path.join(os.path.dirname(state_dict), "scaler.pkl"), "rb") as f:
 dpm = string_to_model[param_dict["MODEL"]["NAME"]](param_dict, eval=True)
 dpm.cuda()
 dpm.load_state_dict(torch.load(state_dict))
+Ts = float(dpm.timestep)
 features, labels, poses = write_dataset(dataset_file, dpm.horizon, save=False)
 dpm_dataset = string_to_dataset[param_dict["MODEL"]["NAME"]](features[:3000], labels[:3000], dpm_scaler)
 dpm_predictions = np.zeros((len(dpm_dataset)-HORIZON, 6, HORIZON+1))
@@ -132,7 +133,7 @@ for inputs, labels, norm_inputs in tqdm(dpm_data_loader, total=len(dpm_predictio
 		dpm_predictions[idt,1,idh+1] = dpm_predictions[idt,1,idh] + (dpm_predictions[idt,3,idh]*np.sin(dpm_predictions[idt,2,idh]) + dpm_predictions[idt,4,idh]*np.cos(dpm_predictions[idt,2,idh])) * Ts
 		dpm_predictions[idt,2,idh+1] = dpm_predictions[idt,2,idh] + dpm_predictions[idt,5,idh] * Ts
 		dpm_input = np.array([*dpm_predictions[idt,3:,idh], *features[idt+idh, -1, 3:]]).reshape(1,1,-1)
-		dxdt = dpm.differential_equation(torch.from_numpy(dpm_input).to(device), dpm_output, Ts) 
+		dxdt = dpm.differential_equation(torch.from_numpy(dpm_input).to(device), dpm_output) 
 		dxdt = dxdt.cpu().detach().numpy()[-1]
 		dpm_predictions[idt,3,idh+1] = dxdt[0]
 		dpm_predictions[idt,4,idh+1] = dxdt[1]
@@ -157,6 +158,7 @@ with open(param_file, 'rb') as f:
 dpm = string_to_model[param_dict["MODEL"]["NAME"]](param_dict, eval=True)
 dpm.cuda()
 dpm.load_state_dict(torch.load(state_dict))
+Ts = float(dpm.timestep)
 features, labels, poses = write_dataset(dataset_file, dpm.horizon, save=False)
 dpm_dataset = string_to_dataset[param_dict["MODEL"]["NAME"]](features[:3000], labels[:3000])
 dpm_plus_predictions = np.zeros((len(dpm_dataset)-HORIZON, 6, HORIZON+1))
@@ -184,7 +186,7 @@ for inputs, labels, norm_inputs in tqdm(dpm_data_loader, total=len(dpm_predictio
 		dpm_plus_predictions[idt,1,idh+1] = dpm_plus_predictions[idt,1,idh] + (dpm_plus_predictions[idt,3,idh]*np.sin(dpm_plus_predictions[idt,2,idh]) + dpm_plus_predictions[idt,4,idh]*np.cos(dpm_plus_predictions[idt,2,idh])) * Ts
 		dpm_plus_predictions[idt,2,idh+1] = dpm_plus_predictions[idt,2,idh] + dpm_plus_predictions[idt,5,idh] * Ts
 		dpm_input = np.array([*dpm_plus_predictions[idt,3:,idh], *features[idt+idh, -1, 3:]]).reshape(1,1,-1)
-		dxdt = dpm.differential_equation(torch.from_numpy(dpm_input).to(device), dpm_output, Ts) 
+		dxdt = dpm.differential_equation(torch.from_numpy(dpm_input).to(device), dpm_output) 
 		dxdt = dxdt.cpu().detach().numpy()[-1]
 		dpm_plus_predictions[idt,3,idh+1] = dxdt[0]
 		dpm_plus_predictions[idt,4,idh+1] = dxdt[1]
@@ -207,6 +209,7 @@ with open(param_file, 'rb') as f:
 dpm = string_to_model[param_dict["MODEL"]["NAME"]](param_dict, eval=True)
 dpm.cuda()
 dpm.load_state_dict(torch.load(state_dict))
+Ts = float(dpm.timestep)
 features, labels, poses = write_dataset(dataset_file, dpm.horizon, save=False)
 dpm_dataset = string_to_dataset[param_dict["MODEL"]["NAME"]](features[:3000], labels[:3000])
 dpm_minus_predictions = np.zeros((len(dpm_dataset)-HORIZON, 6, HORIZON+1))
@@ -234,7 +237,7 @@ for inputs, labels, norm_inputs in tqdm(dpm_data_loader, total=len(dpm_predictio
 		dpm_minus_predictions[idt,1,idh+1] = dpm_minus_predictions[idt,1,idh] + (dpm_minus_predictions[idt,3,idh]*np.sin(dpm_minus_predictions[idt,2,idh]) + dpm_minus_predictions[idt,4,idh]*np.cos(dpm_minus_predictions[idt,2,idh])) * Ts
 		dpm_minus_predictions[idt,2,idh+1] = dpm_minus_predictions[idt,2,idh] + dpm_minus_predictions[idt,5,idh] * Ts
 		dpm_input = np.array([*dpm_minus_predictions[idt,3:,idh], *features[idt+idh, -1, 3:]]).reshape(1,1,-1)
-		dxdt = dpm.differential_equation(torch.from_numpy(dpm_input).to(device), dpm_output, Ts) 
+		dxdt = dpm.differential_equation(torch.from_numpy(dpm_input).to(device), dpm_output) 
 		dxdt = dxdt.cpu().detach().numpy()[-1]
 		dpm_minus_predictions[idt,3,idh+1] = dxdt[0]
 		dpm_minus_predictions[idt,4,idh+1] = dxdt[1]
