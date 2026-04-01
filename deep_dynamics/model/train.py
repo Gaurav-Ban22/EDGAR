@@ -63,13 +63,13 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
                 h = h.data
             model.zero_grad()
             if model.is_rnn:
-                output, h, _ = model(inputs, norm_inputs, h)
+                output, h, ff = model(inputs, norm_inputs, h)
             else:
-                output, _, _ = model(inputs, norm_inputs)
+                output, _, ff = model(inputs, norm_inputs)
             loss = model.weighted_mse_loss(output, labels, weights).mean()
             # Add physics residual loss for PINN models
             if hasattr(model, 'physics_residual'):
-                physics_loss = model.physics_residual(inputs, output)
+                physics_loss = model.physics_residual(inputs, ff)
                 loss = loss + model.physics_weight * physics_loss
             train_loss_accum += loss.item()
             train_steps += 1
@@ -84,13 +84,13 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
             inp, lab, norm_inp = inp.to(device), lab.to(device), norm_inp.to(device)
             if model.is_rnn:
                 val_h = val_h.data
-                out, val_h, _ = model(inp, norm_inp, val_h)
+                out, val_h, ff_val = model(inp, norm_inp, val_h)
             else:
-                out, _, _ = model(inp, norm_inp)
+                out, _, ff_val = model(inp, norm_inp)
             val_loss = model.weighted_mse_loss(out, lab, weights).mean()
             # Add physics residual loss for PINN models during validation
             if hasattr(model, 'physics_residual'):
-                val_physics_loss = model.physics_residual(inp, out)
+                val_physics_loss = model.physics_residual(inp, ff_val)
                 val_loss = val_loss + model.physics_weight * val_physics_loss
             val_loss_accum += val_loss.item()
             val_steps += 1
