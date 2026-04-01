@@ -424,12 +424,130 @@ class DeepDynamicsPINN(ModelBase):
         return total_physics_loss
 
 
+class DeepDynamicsPCNNPINN(ModelBase):
+    """Hybrid PCNN + PINN Architecture.
+    
+    This model utilizes the GuardLayer from the PCNN to ensure outputs remain strictly within 
+    defined bounds, and computes internal state natively. However, it additionally applies the 
+    LASSO (L1) loss penalty to gently pull the Neural Network's predicted coefficients toward 
+    the fundamental theoretical physical mathematical equations (Taylor Baselines).
+    """
+    def __init__(self, param_dict, eval=False):
+
+        class GuardLayer(nn.Module):
+            def __init__(self, param_dict):
+                super().__init__()
+                guard_output = create_module("DENSE", param_dict["MODEL"]["LAYERS"][-1]["OUT_FEATURES"], param_dict["MODEL"]["HORIZON"], len(param_dict["PARAMETERS"]), activation="Sigmoid")
+                self.guard_dense = guard_output[0]
+                self.guard_activation = guard_output[1]
+                self.coefficient_ranges = torch.zeros(len(param_dict["PARAMETERS"])).to(device)
+                self.coefficient_mins = torch.zeros(len(param_dict["PARAMETERS"])).to(device)
+                for i in range(len(param_dict["PARAMETERS"])):
+                    self.coefficient_ranges[i] = param_dict["PARAMETERS"][i]["Max"]- param_dict["PARAMETERS"][i]["Min"]
+                    self.coefficient_mins[i] = param_dict["PARAMETERS"][i]["Min"]
+
+            def forward(self, x):
+                guard_output = self.guard_dense(x)
+                guard_output = self.guard_activation(guard_output) * self.coefficient_ranges + self.coefficient_mins
+                return guard_output
+
+        super().__init__(param_dict, [GuardLayer(param_dict)], eval)
+        self.physics_weight = param_dict["MODEL"]["OPTIMIZATION"].get("PHYSICS_LOSS_WEIGHT", 1.0)
+
+    def differential_equation(self, x, output, Ts=0.02):
+        # Calculate state updates using the dynamically predicted coefficients
+        sys_param_dict, _ = self.unpack_sys_params(output)
+        state_action_dict = self.unpack_state_actions(x)
+        steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
+        throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
+        
+        # Explicit Physics Additions: Load Transfer + Aero Downforce
+        accel_x_approx = (throttle * sys_param_dict["Cm1"] - sys_param_dict["Cr0"]) / self.vehicle_specs["mass"]
+        F_downforce_f, F_downforce_r = compute_aero_forces(
+            state_action_dict["VX"], state_action_dict["VY"], self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"]
+        )
+        delta_Fz = compute_load_transfer(
+            self.vehicle_specs["h"], self.vehicle_specs["L"], 
+            self.vehicle_specs["mass"], accel_x_approx
+        )
+        F_zf, F_zr = compute_normal_forces(
+            self.vehicle_specs["mass"], self.vehicle_specs["g"],
+            self.vehicle_specs["lf"], self.vehicle_specs["lr"],
+            self.vehicle_specs["L"], delta_Fz, F_downforce_f, F_downforce_r
+        )
+        
+        # The Peak Friction parameters are explicitly scaled by load transfers prior to the tire curve calculations
+        Ffy_max = sys_param_dict["Df"] * F_zf / (self.vehicle_specs["mass"] * self.vehicle_specs["g"] * self.vehicle_specs["lr"] / self.vehicle_specs["L"])
+        Fry_max = sys_param_dict["Dr"] * F_zr / (self.vehicle_specs["mass"] * self.vehicle_specs["g"] * self.vehicle_specs["lf"] / self.vehicle_specs["L"])
+        
+        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"])) + sys_param_dict["Shf"]
+        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"])) + sys_param_dict["Shr"]
+        
+        Frx = (sys_param_dict["Cm1"]-sys_param_dict["Cm2"]*state_action_dict["VX"])*throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"]*(state_action_dict["VX"]**2)
+        Ffy = sys_param_dict["Svf"] + Ffy_max * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+        Fry = sys_param_dict["Svr"] + Fry_max * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+        
+        dxdt = torch.zeros(len(x), 3).to(device)
+        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
+        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
+        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
+        dxdt *= Ts
+        return x[:,-1,:3] + dxdt
+
+    def physics_residual(self, x, output, Ts=0.02):
+        """
+        Computes the LASSO (L1) penalty between the PCNN's bounded dynamic coefficients 
+        and the fundamental physical Taylor series mathematical baselines.
+        """
+        sys_param_dict, _ = self.unpack_sys_params(output)
+        state_action_dict = self.unpack_state_actions(x)
+        steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
+
+        accel_x_approx = (state_action_dict["THROTTLE_CMD"] * sys_param_dict["Cm1"] - sys_param_dict["Cr0"]) / self.vehicle_specs["mass"]
+
+        F_downforce_f, F_downforce_r = compute_aero_forces(
+            state_action_dict["VX"], state_action_dict["VY"], self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"]
+        )
+        
+        delta_Fz = compute_load_transfer(
+            self.vehicle_specs["h"], self.vehicle_specs["L"], 
+            self.vehicle_specs["mass"], accel_x_approx
+        )
+        
+        F_zf, F_zr = compute_normal_forces(
+            self.vehicle_specs["mass"], self.vehicle_specs["g"], 
+            self.vehicle_specs["lf"], self.vehicle_specs["lr"], self.vehicle_specs["L"],
+            delta_Fz, F_downforce_f, F_downforce_r
+        )
+        
+        baseline_Df = self.vehicle_specs["mu"] * F_zf
+        baseline_Dr = self.vehicle_specs["mu"] * F_zr
+
+        lasso_Df = torch.mean(torch.abs(sys_param_dict["Df"] - baseline_Df))
+        lasso_Dr = torch.mean(torch.abs(sys_param_dict["Dr"] - baseline_Dr))
+        
+        lasso_Cm2 = torch.mean(torch.abs(sys_param_dict["Cm2"]))
+        lasso_Cr2 = torch.mean(torch.abs(sys_param_dict["Cr2"]))
+        lasso_Shf = torch.mean(torch.abs(sys_param_dict["Shf"]))
+        lasso_Shr = torch.mean(torch.abs(sys_param_dict["Shr"]))
+        lasso_Svf = torch.mean(torch.abs(sys_param_dict["Svf"]))
+        lasso_Svr = torch.mean(torch.abs(sys_param_dict["Svr"]))
+
+        lasso_loss = lasso_Df + lasso_Dr + lasso_Cm2 + lasso_Cr2 + lasso_Shf + lasso_Shr + lasso_Svf + lasso_Svr
+        return lasso_loss
+
+
 string_to_model = {
     "DeepDynamics" : DeepDynamicsModel,
     "DeepPacejka" : DeepPacejkaModel,
     "DeepDynamicsIAC" : DeepDynamicsModelIAC,
     "DeepPacejkaIAC" : DeepPacejkaModelIAC,
-    "DeepDynamicsPINN" : DeepDynamicsPINN
+    "DeepDynamicsPINN" : DeepDynamicsPINN,
+    "DeepDynamicsPCNNPINN" : DeepDynamicsPCNNPINN
 }
 
 string_to_dataset = {
@@ -437,5 +555,6 @@ string_to_dataset = {
     "DeepPacejka" : DeepPacejkaDataset,
     "DeepDynamicsIAC" : DeepDynamicsDataset,
     "DeepPacejkaIAC" : DeepPacejkaDataset,
-    "DeepDynamicsPINN" : DeepDynamicsDataset
+    "DeepDynamicsPINN" : DeepDynamicsDataset,
+    "DeepDynamicsPCNNPINN" : DeepDynamicsDataset
 }
