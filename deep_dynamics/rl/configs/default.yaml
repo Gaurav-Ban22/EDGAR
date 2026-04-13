@@ -1,0 +1,72 @@
+# =============================================================================
+# Phase 7 — central RL config (paths relative to this file unless absolute).
+# Run from `EDGAR/`:  python -m deep_dynamics.rl.scripts.train --config <this file>
+# =============================================================================
+
+# --- Dynamics model (Deep Dynamics checkpoint + training YAML) ---
+dynamics:
+  model_config_path: ../../cfgs/model/deep_dynamics_iac.yaml
+  checkpoint_path: ../../output/deep_dynamics_iac/my_experiment_name/epoch_82.pth
+  scaler_path: ../../output/deep_dynamics_iac/my_experiment_name/scaler.pkl
+  device: cpu   # or cuda
+
+# --- Track ---
+track:
+  track_dir: ../../visualize/tracks
+  track_name: lvms
+
+# --- Environment ---
+env:
+  max_steps: 5000
+  initial_speed: 15.0
+  n_curvature_points: 10
+  curvature_lookahead_spacing: 5.0
+  boundary_margin: 0.0
+  stuck_vx_threshold: 1.0
+  stuck_steps_threshold: 50
+
+# --- Action bounds ---
+# CRITICAL: must match the Deep Dynamics training data distribution.
+# scaler.pkl shows throttle_cmd std≈0.004, steering_cmd std≈0.0004.
+# These bounds cover ~3× the std — wide enough to explore, narrow enough
+# to keep the dynamics model in-distribution.
+action:
+  throttle_cmd_range: [-0.015, 0.015]
+  steering_cmd_range: [-0.0015, 0.0015]
+
+# --- Reward ---
+reward:
+  alpha_d: 0.1
+  alpha_h: 0.5
+  alpha_a: 0.01
+  alpha_v: 0.0
+  vx_max: 50.0            # m/s — penalize above this (scaler 3σ upper bound)
+  alpha_overspeed: 1.0     # quadratic penalty weight for vx > vx_max
+  crash_penalty: 100.0
+  stuck_penalty: 50.0
+  lap_bonus: 0.0
+
+# --- SAC ---
+sac:
+  lr_actor: 3.0e-4
+  lr_critic: 3.0e-4
+  lr_alpha: 3.0e-4
+  gamma: 0.99
+  tau: 0.005
+  batch_size: 256
+  buffer_size: 1000000
+  initial_random_steps: 10000
+  target_entropy: -2.0
+  hidden_dim: 256
+
+# --- Training loop ---
+training:
+  # Full runs can take hours; use --max-episodes 500 for dev
+  max_episodes: 10000
+  eval_every: 50
+  save_every: 100
+  log_every: 10
+  checkpoint_dir: ../../rl_runs/checkpoints
+  log_dir: ../../rl_runs/logs
+  eval_seed: 42
+  train_seed: null

@@ -62,9 +62,19 @@ class DynamicsWrapper:
         self.n_actions = len(self.param_dict["ACTIONS"])
         self.n_features = self.n_states + self.n_actions  # 7 for IAC DeepDynamics
 
+        # Feedback clamps — keep accumulated values inside training distribution.
+        # Defaults from scaler ± 3σ; override via set_feedback_clamps().
+        self.throttle_fb_range = (-0.1, 0.5)
+        self.steering_fb_range = (-0.02, 0.025)
+
         # Runtime state (populated by reset)
         self.history: np.ndarray | None = None
         self.h: torch.Tensor | None = None  # RNN hidden state
+
+    @property
+    def Ts(self) -> float:
+        """Simulation period (s); same as ``timestep`` (plan naming)."""
+        return float(self.timestep)
 
     # ------------------------------------------------------------------
     # Reset
@@ -117,8 +127,16 @@ class DynamicsWrapper:
         new_row[0] = prev[0]                  # VX  (overwritten below)
         new_row[1] = prev[1]                  # VY
         new_row[2] = prev[2]                  # YAW_RATE
-        new_row[3] = prev[3] + throttle_cmd   # THROTTLE_FB accumulates
-        new_row[4] = prev[4] + steering_cmd   # STEERING_FB accumulates
+        new_row[3] = np.clip(
+            prev[3] + throttle_cmd,
+            self.throttle_fb_range[0],
+            self.throttle_fb_range[1],
+        )
+        new_row[4] = np.clip(
+            prev[4] + steering_cmd,
+            self.steering_fb_range[0],
+            self.steering_fb_range[1],
+        )
         new_row[5] = throttle_cmd              # THROTTLE_CMD (delta)
         new_row[6] = steering_cmd              # STEERING_CMD (delta)
 

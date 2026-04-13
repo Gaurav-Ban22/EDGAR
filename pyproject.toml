@@ -15,8 +15,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
+    "gymnasium>=0.29",
     "matplotlib",
     "numpy",
+    "pyyaml",
+    "tensorboard",
     "torch",
     "wandb",
     "ray[tune]",

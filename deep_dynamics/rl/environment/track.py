@@ -204,6 +204,35 @@ class Track:
 
         return idx, float(s), float(e_lat), float(heading)
 
+    def cartesian_to_frenet(
+        self, x: float, y: float
+    ) -> Tuple[float, float, float]:
+        """Alias for :meth:`project` in (s, d, heading) form (Phase 4 / plan API)."""
+        _, s, e_lat, heading = self.project(x, y)
+        return s, e_lat, heading
+
+    def update_progress(self, s_prev: float, s_new: float) -> Tuple[float, bool]:
+        """Arc-length step and whether the agent crossed the finish (forward wrap).
+
+        Returns
+        -------
+        delta_s
+            Shortest signed progress along the loop from *s_prev* to *s_new*.
+        crossed_finish_line
+            True when the shortest forward path wraps past the start line.
+        """
+        L = self.total_length
+        if L <= 1e-9:
+            return 0.0, False
+        a = float(s_prev % L)
+        b = float(s_new % L)
+        raw = b - a
+        if raw < -L / 2.0:
+            return raw + L, True
+        if raw > L / 2.0:
+            return raw - L, False
+        return raw, False
+
     def frenet_to_cartesian(
         self, s: float, e_lat: float
     ) -> Tuple[float, float, float]:
@@ -300,6 +329,22 @@ class Track:
         return ax
 
     # -- convenience --------------------------------------------------------
+
+    @property
+    def cumulative_s(self) -> NDArray:
+        """Same as ``center_s`` (plan / legacy name)."""
+        return self.center_s
+
+    @property
+    def headings(self) -> NDArray:
+        """Same as ``center_heading`` (plan / legacy name)."""
+        return self.center_heading
+
+    def is_within_bounds(self, x: float, y: float, margin: float = 0.0) -> bool:
+        """Plan API: inside track; *margin* shrinks the allowed half-width."""
+        idx, _, e_lat, _ = self.project(x, y)
+        hw = float(self.half_widths[idx]) - margin
+        return bool(abs(e_lat) <= max(hw, 0.0))
 
     @property
     def start_xy(self) -> Tuple[float, float]:
