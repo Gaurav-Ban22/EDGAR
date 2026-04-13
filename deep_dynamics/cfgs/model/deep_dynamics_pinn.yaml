@@ -73,58 +73,12 @@ VEHICLE_SPECS:
   C_lr: 0.0
   mu: 0.8
 MODEL:
-  NAME: DeepDynamics
+  NAME: DeepDynamicsPINN
   HORIZON: 5
-  TIMESTEP: 0.04
   LAYERS:
     - GRU:
       OUT_FEATURES: 25
-      LAYERS: 7
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
-    - DENSE:
-      OUT_FEATURES: 436
-      ACTIVATION: Mish
+      LAYERS: 2
     - DENSE:
       OUT_FEATURES: 436
       ACTIVATION: Mish
