@@ -63,8 +63,17 @@ VEHICLE_SPECS:
   lf: 1.248
   lr: 1.7328
   mass: 790.0
+  h: 0.30
+  L: 2.9808
+  rho: 1.225
+  g: 9.81
+  A_f: 1.0
+  A_r: 1.2
+  C_lf: 1.5
+  C_lr: 2.0
+  mu: 1.2
 MODEL:
-  NAME: DeepDynamicsIAC
+  NAME: DeepDynamics
   HORIZON: 5
   LAYERS:
     - GRU:

@@ -214,9 +214,9 @@ class DeepDynamicsModel(ModelBase):
             self.vehicle_specs["mass"], accel_x_approx
         )
         F_zf, F_zr = compute_normal_forces(
-            self.vehicle_specs["mass"], self.vehicle_specs["g"],
             self.vehicle_specs["lf"], self.vehicle_specs["lr"],
-            self.vehicle_specs["L"], delta_Fz, F_downforce_f, F_downforce_r
+            self.vehicle_specs["L"], self.vehicle_specs["mass"],
+            self.vehicle_specs["g"], delta_Fz, F_downforce_f, F_downforce_r
         )
         # Scale the NN predicted peak friction by the analytical load shift
         Ffy_max = sys_param_dict["Df"] * F_zf / (self.vehicle_specs["mass"] * self.vehicle_specs["g"] * self.vehicle_specs["lr"] / self.vehicle_specs["L"])
@@ -378,9 +378,9 @@ class DeepDynamicsPINN(ModelBase):
         )
         
         F_zf, F_zr = compute_normal_forces(
-            self.vehicle_specs["mass"], self.vehicle_specs["g"],
             self.vehicle_specs["lf"], self.vehicle_specs["lr"],
-            self.vehicle_specs["L"], delta_Fz, F_downforce_f, F_downforce_r
+            self.vehicle_specs["L"], self.vehicle_specs["mass"],
+            self.vehicle_specs["g"], delta_Fz, F_downforce_f, F_downforce_r
         )
         
         # Determine strict Newtonian scale for peak friction using load shift
@@ -414,13 +414,9 @@ class DeepDynamicsPINN(ModelBase):
         # Objective C: Sparsify unknown higher-order geometric boundaries
         lasso_Cm2 = torch.mean(torch.abs(sys_param_dict["Cm2"])) 
         lasso_Cr2 = torch.mean(torch.abs(sys_param_dict["Cr2"])) 
-        lasso_Shf = torch.mean(torch.abs(sys_param_dict["Shf"])) 
-        lasso_Shr = torch.mean(torch.abs(sys_param_dict["Shr"]))
-        lasso_Svf = torch.mean(torch.abs(sys_param_dict["Svf"]))
-        lasso_Svr = torch.mean(torch.abs(sys_param_dict["Svr"]))
 
         # Total unified physics loss bounds the entirely naked neural network predictions
-        total_physics_loss = ode_loss + lasso_Df + lasso_Dr + lasso_Cm2 + lasso_Cr2 + lasso_Shf + lasso_Shr + lasso_Svf + lasso_Svr
+        total_physics_loss = ode_loss + lasso_Df + lasso_Dr + lasso_Cm2 + lasso_Cr2
         return total_physics_loss
 
 
@@ -473,9 +469,9 @@ class DeepDynamicsPCNNPINN(ModelBase):
             self.vehicle_specs["mass"], accel_x_approx
         )
         F_zf, F_zr = compute_normal_forces(
-            self.vehicle_specs["mass"], self.vehicle_specs["g"],
             self.vehicle_specs["lf"], self.vehicle_specs["lr"],
-            self.vehicle_specs["L"], delta_Fz, F_downforce_f, F_downforce_r
+            self.vehicle_specs["L"], self.vehicle_specs["mass"],
+            self.vehicle_specs["g"], delta_Fz, F_downforce_f, F_downforce_r
         )
         
         # The Peak Friction parameters are explicitly scaled by load transfers prior to the tire curve calculations
@@ -519,9 +515,9 @@ class DeepDynamicsPCNNPINN(ModelBase):
         )
         
         F_zf, F_zr = compute_normal_forces(
-            self.vehicle_specs["mass"], self.vehicle_specs["g"], 
-            self.vehicle_specs["lf"], self.vehicle_specs["lr"], self.vehicle_specs["L"],
-            delta_Fz, F_downforce_f, F_downforce_r
+            self.vehicle_specs["lf"], self.vehicle_specs["lr"],
+            self.vehicle_specs["L"], self.vehicle_specs["mass"],
+            self.vehicle_specs["g"], delta_Fz, F_downforce_f, F_downforce_r
         )
         
         baseline_Df = self.vehicle_specs["mu"] * F_zf
@@ -532,12 +528,8 @@ class DeepDynamicsPCNNPINN(ModelBase):
         
         lasso_Cm2 = torch.mean(torch.abs(sys_param_dict["Cm2"]))
         lasso_Cr2 = torch.mean(torch.abs(sys_param_dict["Cr2"]))
-        lasso_Shf = torch.mean(torch.abs(sys_param_dict["Shf"]))
-        lasso_Shr = torch.mean(torch.abs(sys_param_dict["Shr"]))
-        lasso_Svf = torch.mean(torch.abs(sys_param_dict["Svf"]))
-        lasso_Svr = torch.mean(torch.abs(sys_param_dict["Svr"]))
 
-        lasso_loss = lasso_Df + lasso_Dr + lasso_Cm2 + lasso_Cr2 + lasso_Shf + lasso_Shr + lasso_Svf + lasso_Svr
+        lasso_loss = lasso_Df + lasso_Dr + lasso_Cm2 + lasso_Cr2
         return lasso_loss
 
 
