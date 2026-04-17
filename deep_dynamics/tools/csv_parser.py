@@ -2,7 +2,7 @@
 
 import numpy as np
 import sys
-from tqdm import tqdm
+#from tqdm import tqdm
 import csv
 
 MAX_BRAKE_PRESSURE = 2757.89990234
@@ -25,16 +25,10 @@ def write_dataset(csv_path, horizon, save=True):
                     column_idxs[row[i].split("(")[0]] = i
                 continue
             vx = float(row[column_idxs["vx"]])
-            if abs(vx) < 5:
-                if started:
-                    break
-                brake = float(row[column_idxs["brake_ped_cmd"]])
-                throttle = float(row[column_idxs["throttle_ped_cmd"]])
-                if brake > 0.0:
-                    previous_throttle = -brake / MAX_BRAKE_PRESSURE
-                else:
-                    previous_throttle = throttle / 100.0
-                previous_steer = float(row[column_idxs["delta"]])
+            
+            # Remove the abs(vx) < 5 truncation check which previously discarded 90% of the track data
+            if abs(vx) < 0.1:
+                # Still skip completely stopped cars
                 continue
             vy = float(row[column_idxs["vy"]])
             vtheta = float(row[column_idxs["omega"]])
@@ -59,7 +53,7 @@ def write_dataset(csv_path, horizon, save=True):
         steering_cmds = np.array(steering_cmds)
         features = np.zeros((len(throttle_cmds) - horizon - 1,  horizon, 8), dtype=np.double)
         labels = np.zeros((len(throttle_cmds) - horizon - 1, 3), dtype=np.double)
-        for i in tqdm(range(len(throttle_cmds) - horizon - 1 - 5), desc="Compiling dataset"):
+        for i in range(len(throttle_cmds) - horizon - 1 - 5):
             features[i] = np.array([*odometry[i:i+horizon].T, throttle_cmds[i:i+horizon], steering_cmds[i:i+horizon], odometry[i+5:i+horizon+5,0]]).T
             labels[i] = np.array([*odometry[i+horizon]])[:3]
         poses = np.array(poses)

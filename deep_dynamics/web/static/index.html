@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>trajectory viewer</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>trajectory viewer</h1>
+            <p>evaluate mathematical chassis dynamics models against real-world imu/gps telemetry.</p>
+        </header>
+
+        <div class="layout">
+            <aside class="sidebar">
+                <section class="control-block">
+                    <label>vehicle class</label>
+                    <select id="car-select">
+                        <option value="INDY">Indycar</option>
+                        <option value="RC">1:43 Scale RC</option>
+                    </select>
+                </section>
+                
+                <section class="control-block">
+                    <label>location / track</label>
+                    <select id="track-select">
+                        <option value="VEGAS_A">Las Vegas (Run A)</option>
+                        <option value="VEGAS_B">Las Vegas (Run B)</option>
+                        <option value="PUTNAM_2">Putnam Park</option>
+                        <option value="ETHZ_MOBIL">ETH Zurich</option>
+                    </select>
+                </section>
+
+                <section class="control-block">
+                    <label>simulation timeline slice</label>
+                    <div class="slider-container">
+                        <input type="range" id="time-start" min="0" max="100" value="10">
+                    </div>
+                    <div class="slider-labels" style="align-items: center;">
+                        <span id="start-val">10%</span>
+                        <div style="display:flex; align-items:center; gap:0.3rem;">
+                            <span style="color:var(--border);">+</span>
+                            <input type="number" id="window-size" value="2" min="1" max="100" class="minimal-input">
+                            <span style="color:var(--border);">% window</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="control-block" id="model-toggles" style="display:none;">
+                    <label>active models</label>
+                    <div id="checkbox-list" class="checkbox-list">
+                        <!-- Checkboxes auto-injected by JS -->
+                    </div>
+                </section>
+
+                <button id="load-btn" class="minimal-btn">run simulation</button>
+            </aside>
+
+            <main class="chart-area" style="position:relative;">
+                <div style="position:absolute; top:1rem; right:1rem; z-index:10; display:flex; gap:0.5rem;">
+                    <button id="zoom-in" class="minimal-btn" style="padding: 0.4rem 0.6rem; font-size:0.8rem; background:white; color:var(--text-main); border:1px solid var(--border);">+</button>
+                    <button id="zoom-out" class="minimal-btn" style="padding: 0.4rem 0.6rem; font-size:0.8rem; background:white; color:var(--text-main); border:1px solid var(--border);">-</button>
+                    <button id="reset-zoom" class="minimal-btn" style="padding: 0.4rem 0.6rem; font-size:0.8rem; background:white; color:var(--text-main); border:1px solid var(--border);">reset view</button>
+                </div>
+                <canvas id="trajectoryChart"></canvas>
+            </main>
+        </div>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>
