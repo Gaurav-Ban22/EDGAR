@@ -6,10 +6,7 @@ import pickle
 import numpy as np
 import time
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
+device = torch.device("cpu")
 
 def pretty(d, indent=0):
    for key, value in d.items():

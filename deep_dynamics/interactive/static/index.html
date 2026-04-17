@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deep Dynamics — Racing Line Predictor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="app">
+
+    <nav class="topbar" aria-label="Controls">
+      <div class="topbar-left">
+        <span class="brand">Deep Dynamics</span>
+      </div>
+
+      <div class="topbar-center" role="toolbar" aria-label="Track and controller selection">
+        <label class="seg-select">
+          <span class="seg-label">Track</span>
+          <select id="track-id" aria-label="Track"></select>
+        </label>
+        <label class="seg-select">
+          <span class="seg-label">Model</span>
+          <select id="model-id" aria-label="Dynamics model"></select>
+        </label>
+        <label class="seg-select">
+          <span class="seg-label">Controller</span>
+          <select id="controller-id" aria-label="Controller"></select>
+        </label>
+      </div>
+
+      <div class="topbar-right">
+        <span id="status" class="status-inline" aria-live="polite">Starting…</span>
+        <button id="btn-clear" class="btn btn-ghost" title="Clear drawing, start point, and prediction">Clear</button>
+      </div>
+    </nav>
+
+    <section id="stage" class="stage" aria-label="Track canvas">
+      <canvas id="track"></canvas>
+      <canvas id="pred"></canvas>
+      <canvas id="draw"></canvas>
+
+      <div class="pill pill-hint" id="hint-pill">
+        <span class="hint-dot"></span>
+        <span>Drag to draw a racing line · Click to place a start point</span>
+      </div>
+
+      <div class="pill pill-action hidden" id="action-pill" role="region" aria-label="Start point actions">
+        <div class="action-info">
+          <div class="action-title">Start placed</div>
+          <div class="action-sub" id="action-sub">Heading auto · 25 m/s</div>
+        </div>
+        <button id="btn-flip" class="pill-btn" title="Flip direction 180°">Flip</button>
+        <button id="btn-simulate" class="pill-btn pill-btn-primary" title="Run prediction from this point">Simulate</button>
+        <button id="btn-cancel-start" class="pill-btn pill-btn-ghost" title="Cancel start point" aria-label="Cancel">✕</button>
+      </div>
+
+      <div class="pill pill-zoom" role="group" aria-label="View controls">
+        <button id="btn-zoom-out" class="pill-btn pill-btn-icon" title="Zoom out" aria-label="Zoom out">−</button>
+        <span id="zoom-value" class="pill-value" aria-live="polite">100%</span>
+        <button id="btn-zoom-in" class="pill-btn pill-btn-icon" title="Zoom in" aria-label="Zoom in">+</button>
+        <div class="pill-sep" aria-hidden="true"></div>
+        <button id="btn-fit" class="pill-btn pill-btn-text" title="Fit full track in view">Fit</button>
+      </div>
+    </section>
+
+    <div class="params-row" aria-label="Prediction parameters">
+      <label class="param-field">
+        <span class="param-label">Target speed</span>
+        <span class="param-input">
+          <input id="v-target" type="number" min="8" max="45" step="1" placeholder="auto" />
+          <span class="param-unit">m/s</span>
+        </span>
+      </label>
+      <label class="param-field">
+        <span class="param-label">Prediction steps</span>
+        <span class="param-input">
+          <input id="max-steps" type="number" min="10" max="1500" step="10" value="300" />
+          <span class="param-unit">× 0.04 s</span>
+        </span>
+      </label>
+    </div>
+
+    <section id="stats" class="stats" aria-live="polite"></section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

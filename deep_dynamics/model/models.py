@@ -8,10 +8,7 @@ import numpy as np
 from abc import abstractmethod
 
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
+device = torch.device("cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +264,155 @@ class DeepDynamicsModel(ModelBase):
         return x[:,-1,:3] + dxdt
 
 
+class DeepDynamicsPINNModel(DeepDynamicsModel):
+    """
+    Deep Dynamics model with PINN-style composite loss function.
+    Same architecture as DeepDynamicsModel (GRU + dense + guard layer + physics ODE)
+    but the loss includes ODE residuals at interior timesteps, energy conservation,
+    and parameter regularization in addition to the standard data fidelity term.
+    """
+
+    def __init__(self, param_dict, eval=False):
+        super().__init__(param_dict, eval)
+        pinn_cfg = param_dict.get("PINN", {})
+        self.lambda_data = pinn_cfg.get("LAMBDA_DATA", 1.0)
+        self.lambda_ode = pinn_cfg.get("LAMBDA_ODE", 0.01)
+        self.lambda_energy = pinn_cfg.get("LAMBDA_ENERGY", 0.001)
+        self.lambda_param_reg = pinn_cfg.get("LAMBDA_PARAM_REG", 0.0001)
+        self._Ts = pinn_cfg.get("TS", 0.02)
+        self._warmup_start = pinn_cfg.get("WARMUP_START", 50)
+        self._warmup_end = pinn_cfg.get("WARMUP_END", 150)
+
+        self._state_idx = {name: i for i, name in enumerate(self.state)}
+        self._action_idx = {name: len(self.state) + i for i, name in enumerate(self.actions)}
+
+        self._nominal_params = {}
+        for p in self.param_dict["PARAMETERS"]:
+            for key, val in p.items():
+                if key not in ("Min", "Max") and val is not None:
+                    self._nominal_params[key] = float(val)
+
+    def _feat(self, x, t, name):
+        idx = self._state_idx.get(name, self._action_idx.get(name))
+        return x[:, t, idx]
+
+    def _physics_derivs(self, vx, vy, omega, steering, throttle, sp):
+        """Evaluate the vehicle dynamics ODE for arbitrary state/action values."""
+        m = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        h = self.vehicle_specs["h"]
+
+        alphaf = steering - torch.atan2(lf * omega + vy, torch.abs(vx)) + sp["Shf"]
+        alphar = torch.atan2(lr * omega - vy, torch.abs(vx)) + sp["Shr"]
+
+        F_rx_desired = (sp["Cm1"] - sp["Cm2"] * vx) * throttle \
+                       - sp["Cr0"] - sp["Cr2"] * (vx ** 2)
+
+        a_x = F_rx_desired / m
+        delta_W = compute_load_transfer(h, L, m, a_x)
+        F_aero_f, F_aero_r = compute_aero_forces(
+            vx, vy, self.vehicle_specs["rho"],
+            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
+            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+        F_fz, F_rz = compute_normal_forces(lf, lr, L, m, self.vehicle_specs["g"],
+                                            delta_W, F_aero_f, F_aero_r)
+
+        mu = self.vehicle_specs["mu"]
+        D_f = mu * F_fz
+        D_r = mu * F_rz
+
+        Ffy = sp["Svf"] + D_f * torch.sin(sp["Cf"] * torch.atan(
+            sp["Bf"] * alphaf - sp["Ef"] * (sp["Bf"] * alphaf - torch.atan(sp["Bf"] * alphaf))))
+        Fry = sp["Svr"] + D_r * torch.sin(sp["Cr"] * torch.atan(
+            sp["Br"] * alphar - sp["Er"] * (sp["Br"] * alphar - torch.atan(sp["Br"] * alphar))))
+        Frx = compute_traction_limited_force(F_rx_desired, mu, F_rz)
+
+        dvx = 1 / m * (Frx - Ffy * torch.sin(steering)) + vy * omega
+        dvy = 1 / m * (Fry + Ffy * torch.cos(steering)) - vx * omega
+        domega = 1 / sp["Iz"] * (Ffy * lf * torch.cos(steering) - Fry * lr)
+        return dvx, dvy, domega, Frx, Ffy, Fry
+
+    def compute_pinn_loss(self, x, predictions, labels, ff_output, epoch=0):
+        sp, _ = self.unpack_sys_params(ff_output)
+        Ts = self._Ts
+        m = self.vehicle_specs["mass"]
+
+        if epoch < self._warmup_start:
+            physics_weight = 0.0
+        elif epoch >= self._warmup_end:
+            physics_weight = 1.0
+        else:
+            physics_weight = (epoch - self._warmup_start) / (self._warmup_end - self._warmup_start)
+
+        # 1. Data fidelity
+        L_data = ((predictions - labels) ** 2).mean()
+
+        # 2. ODE residual at interior timesteps of the input window.
+        #    The learned parameters should be consistent with observed
+        #    state transitions at every timestep, not only the last.
+        L_ode = torch.tensor(0.0, device=x.device)
+        n_interior = x.shape[1] - 1
+        for t in range(n_interior):
+            vx_t = self._feat(x, t, "VX")
+            vy_t = self._feat(x, t, "VY")
+            omega_t = self._feat(x, t, "YAW_RATE")
+            steer_t = self._feat(x, t, "STEERING_FB") + self._feat(x, t, "STEERING_CMD")
+            thr_t = self._feat(x, t, "THROTTLE_FB") + self._feat(x, t, "THROTTLE_CMD")
+
+            obs_delta_vx = self._feat(x, t + 1, "VX") - vx_t
+            obs_delta_vy = self._feat(x, t + 1, "VY") - vy_t
+            obs_delta_om = self._feat(x, t + 1, "YAW_RATE") - omega_t
+
+            p_dvx, p_dvy, p_dom, _, _, _ = self._physics_derivs(
+                vx_t, vy_t, omega_t, steer_t, thr_t, sp)
+
+            L_ode = L_ode + ((p_dvx * Ts - obs_delta_vx) ** 2).mean()
+            L_ode = L_ode + ((p_dvy * Ts - obs_delta_vy) ** 2).mean()
+            L_ode = L_ode + ((p_dom * Ts - obs_delta_om) ** 2).mean()
+        L_ode = L_ode / max(n_interior, 1)
+
+        # 3. Energy conservation: dKE should equal work done by forces.
+        vx = self._feat(x, -1, "VX")
+        vy = self._feat(x, -1, "VY")
+        omega = self._feat(x, -1, "YAW_RATE")
+        steer = self._feat(x, -1, "STEERING_FB") + self._feat(x, -1, "STEERING_CMD")
+        thr = self._feat(x, -1, "THROTTLE_FB") + self._feat(x, -1, "THROTTLE_CMD")
+
+        _, _, _, Frx, Ffy, Fry = self._physics_derivs(vx, vy, omega, steer, thr, sp)
+
+        KE_curr = 0.5 * m * (vx ** 2 + vy ** 2)
+        KE_next = 0.5 * m * (predictions[:, 0] ** 2 + predictions[:, 1] ** 2)
+        P_forces = (Frx * vx + Fry * vy
+                    + Ffy * (vy * torch.cos(steer) - vx * torch.sin(steer)))
+        energy_residual = (KE_next - KE_curr) - P_forces * Ts
+        L_energy = (energy_residual ** 2).mean()
+
+        # 4. Soft regularization toward nominal parameter values.
+        L_param = torch.tensor(0.0, device=x.device)
+        n_reg = 0
+        for key, nominal in self._nominal_params.items():
+            if key in sp:
+                L_param = L_param + ((sp[key] - nominal) ** 2).mean()
+                n_reg += 1
+        if n_reg > 0:
+            L_param = L_param / n_reg
+
+        total = (self.lambda_data * L_data
+                 + physics_weight * (self.lambda_ode * L_ode
+                                     + self.lambda_energy * L_energy
+                                     + self.lambda_param_reg * L_param))
+
+        return total, {
+            "total": total.item(),
+            "data": L_data.item(),
+            "ode": L_ode.item(),
+            "energy": L_energy.item(),
+            "param_reg": L_param.item(),
+        }
+
+
 class DeepPacejkaModel(ModelBase):
     def __init__(self, param_dict, eval=False):
         output_module = create_module("DENSE", param_dict["MODEL"]["LAYERS"][-1]["OUT_FEATURES"], param_dict["MODEL"]["HORIZON"], len(param_dict["PARAMETERS"]), activation=None)
@@ -429,15 +575,16 @@ class DeepPacejkaModelIAC(ModelBase):
 
 string_to_model = {
     "DeepDynamics" : DeepDynamicsModel,
+    "DeepDynamicsPINN" : DeepDynamicsPINNModel,
     "DeepPacejka" : DeepPacejkaModel,
     "DeepDynamicsIAC" : DeepDynamicsModelIAC,
-    "DeepPacejkaIAC" : DeepPacejkaModelIAC
+    "DeepPacejkaIAC" : DeepPacejkaModelIAC,
 }
 
 string_to_dataset = {
     "DeepDynamics" : DeepDynamicsDataset,
+    "DeepDynamicsPINN" : DeepDynamicsDataset,
     "DeepPacejka" : DeepPacejkaDataset,
     "DeepDynamicsIAC" : DeepDynamicsDataset,
     "DeepPacejkaIAC" : DeepPacejkaDataset,
-
 }

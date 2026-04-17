@@ -8,10 +8,7 @@ import os
 import yaml
 import pickle
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
+device = torch.device("cpu")
 
 def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb, output_dir, project_name=None, use_ray_tune=False):
     print("Starting experiment: {}".format(experiment_name))
@@ -47,6 +44,7 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
     model.train()
     model.to(device)
     weights = torch.tensor([1.0, 1.0, 1.0]).to(device)
+    is_pinn = hasattr(model, 'compute_pinn_loss')
     for i in range(model.epochs):
         train_steps = 0
         train_loss_accum = 0.0
@@ -58,10 +56,14 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
                 h = h.data
             model.zero_grad()
             if model.is_rnn:
-                output, h, _ = model(inputs, norm_inputs, h)
+                output, h, ff = model(inputs, norm_inputs, h)
             else:
-                output, _, _ = model(inputs, norm_inputs)
-            loss = model.weighted_mse_loss(output, labels, weights).mean()
+                output, _, ff = model(inputs, norm_inputs)
+            if is_pinn:
+                loss, loss_components = model.compute_pinn_loss(inputs, output, labels, ff, epoch=i)
+            else:
+                loss = model.weighted_mse_loss(output, labels, weights).mean()
+                loss_components = None
             train_loss_accum += loss.item()
             train_steps += 1
             loss.backward()
@@ -75,10 +77,14 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
             inp, lab, norm_inp = inp.to(device), lab.to(device), norm_inp.to(device)
             if model.is_rnn:
                 val_h = val_h.data
-                out, val_h, _ = model(inp, norm_inp, val_h)
+                out, val_h, val_ff = model(inp, norm_inp, val_h)
             else:
-                out, _, _ = model(inp, norm_inp)
-            val_loss = model.weighted_mse_loss(out, lab, weights).mean()
+                out, _, val_ff = model(inp, norm_inp)
+            if is_pinn:
+                val_loss, val_loss_components = model.compute_pinn_loss(inp, out, lab, val_ff, epoch=i)
+            else:
+                val_loss = model.weighted_mse_loss(out, lab, weights).mean()
+                val_loss_components = None
             val_loss_accum += val_loss.item()
             val_steps += 1
         mean_train_loss = train_loss_accum / train_steps
@@ -86,6 +92,10 @@ def train(model, train_data_loader, val_data_loader, experiment_name, log_wandb,
         if log_wandb:
             wandb.log({"train_loss": mean_train_loss })
             wandb.log({"val_loss": mean_val_loss})
+            if is_pinn and loss_components is not None:
+                wandb.log({f"train_pinn_{k}": v for k, v in loss_components.items()})
+            if is_pinn and val_loss_components is not None:
+                wandb.log({f"val_pinn_{k}": v for k, v in val_loss_components.items()})
         if mean_val_loss < valid_loss_min:
             torch.save(model.state_dict(), "%s/epoch_%s.pth" % (output_dir, i+1))
             print('Validation loss decreased ({:.6f} --> {:.6f}).  Saving model ...'.format(valid_loss_min,mean_val_loss))
