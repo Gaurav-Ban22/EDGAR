@@ -214,15 +214,21 @@ function updateChartSlice() {
         });
     }
 
+    const forceGpsPhi = document.getElementById('force-gps-phi').checked;
+
     currentRawData.models.forEach(m => {
         if (checkedNames.has(m.name)) {
             let m_vx = m.vx.slice(globalStart, globalEnd);
             let m_vy = m.vy.slice(globalStart, globalEnd);
             let m_yaw = m.yaw_rate.slice(globalStart, globalEnd);
+            
+            let modelRefPhi = forceGpsPhi ? currentRawData.gps.phi : null;
+            let modelRefIdx = forceGpsPhi ? gpsStartIdx : 0;
+            
             datasets.push({
                 label: m.name,
                 data: integrateTrajectory(m_vx, m_vy, m_yaw, 0.04, x0, y0, phi0,
-                                          null, 0),
+                                          modelRefPhi, modelRefIdx),
                 borderColor: m.color,
                 borderWidth: 2,
                 order: 1
@@ -240,10 +246,12 @@ function buildCheckboxes(data) {
     const entries = [{name: data.ground_truth.name, color: '#111'}, ...data.models];
     
     entries.forEach(m => {
+        const isTarget = ['Ground Truth (IMU)', 'Hybrid PCNN+PINN'].includes(m.name);
+        const checkedAttr = isTarget ? 'checked' : '';
         const div = document.createElement('div');
         div.className = 'checkbox-item';
         div.innerHTML = `
-            <input type="checkbox" class="model-cb" value="${m.name}" checked>
+            <input type="checkbox" class="model-cb" value="${m.name}" ${checkedAttr}>
             <span style="display:inline-block; width:10px; height:10px; background:${m.color}; border-radius:2px;"></span>
             <span>${m.name}</span>
         `;
@@ -302,6 +310,7 @@ async function fetchTrajectories() {
 
 startSlider.addEventListener('input', updateChartSlice);
 windowSizeInput.addEventListener('input', updateChartSlice);
+document.getElementById('force-gps-phi').addEventListener('change', updateChartSlice);
 loadBtn.addEventListener('click', fetchTrajectories);
 
 zoomInBtn.addEventListener('click', () => chartInstance.zoom(1.2));

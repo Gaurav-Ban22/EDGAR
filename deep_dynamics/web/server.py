@@ -62,6 +62,13 @@ MODELS_INDY = [
         "cfg": "deep_dynamics/cfgs/model/deep_dynamics_pcnnpinn_iac.yaml",
         "dir": "../output/deep_dynamics_pcnnpinn_iac/iac_hybrid_pinn/",
         "cls": "DeepDynamicsPCNNPINN"
+    },
+    {
+        "label": "Multi-Step Hybrid",
+        "color": "#E67E22",
+        "cfg": "deep_dynamics/cfgs/model/deep_dynamics_pcnnpinn_multistep_iac.yaml",
+        "dir": "deep_dynamics/output/deep_dynamics_pcnnpinn_multistep_iac/iac_hybrid_multistep/",
+        "cls": "DeepDynamicsPCNNPINNMultiStep"
     }
 ]
 

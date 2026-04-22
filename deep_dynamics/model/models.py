@@ -202,39 +202,49 @@ class DeepDynamicsModel(ModelBase):
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
         throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
         
-        # Explicit Physics Additions: Load Transfer + Aero Downforce for PCNN Baseline
-        accel_x_approx = (throttle * sys_param_dict["Cm1"] - sys_param_dict["Cr0"]) / self.vehicle_specs["mass"]
-        F_downforce_f, F_downforce_r = compute_aero_forces(
-            state_action_dict["VX"], state_action_dict["VY"], self.vehicle_specs["rho"],
-            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
-            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"]
-        )
-        delta_Fz = compute_load_transfer(
-            self.vehicle_specs["h"], self.vehicle_specs["L"], 
-            self.vehicle_specs["mass"], accel_x_approx
-        )
-        F_zf, F_zr = compute_normal_forces(
-            self.vehicle_specs["lf"], self.vehicle_specs["lr"],
-            self.vehicle_specs["L"], self.vehicle_specs["mass"],
-            self.vehicle_specs["g"], delta_Fz, F_downforce_f, F_downforce_r
-        )
-        # Scale the NN predicted peak friction by the analytical load shift
-        Ffy_max = sys_param_dict["Df"] * F_zf / (self.vehicle_specs["mass"] * self.vehicle_specs["g"] * self.vehicle_specs["lr"] / self.vehicle_specs["L"])
-        Fry_max = sys_param_dict["Dr"] * F_zr / (self.vehicle_specs["mass"] * self.vehicle_specs["g"] * self.vehicle_specs["lf"] / self.vehicle_specs["L"])
+        # Pull initial kinematic states at the start of the timestep
+        vx = state_action_dict["VX"].clone()
+        vy = state_action_dict["VY"].clone()
+        yaw_rate = state_action_dict["YAW_RATE"].clone()
+        
+        # 100x internal micro-stepping for geometric accuracy (cut back for GPU performance)
+        steps = 100 if not self.training else 1
+        dt = Ts / steps
 
-        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"])) + sys_param_dict["Shf"]
-        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"])) + sys_param_dict["Shr"]
-        
-        Frx = (sys_param_dict["Cm1"]-sys_param_dict["Cm2"]*state_action_dict["VX"])*throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"]*(state_action_dict["VX"]**2)
-        Ffy = sys_param_dict["Svf"] + Ffy_max * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
-        Fry = sys_param_dict["Svr"] + Fry_max * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
-        
-        dxdt = torch.zeros(len(x), 3).to(device)
-        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
-        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
-        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
-        dxdt *= Ts
-        return x[:,-1,:3] + dxdt
+        # Constant vehicle specs across the timestep
+        mass = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        g = self.vehicle_specs["g"]
+        h = self.vehicle_specs["h"]
+        Iz = sys_param_dict["Iz"]
+
+        for _ in range(steps):
+            accel_x_approx = (throttle * sys_param_dict["Cm1"] - sys_param_dict["Cr0"]) / mass
+            F_downforce_f, F_downforce_r = compute_aero_forces(vx, vy, self.vehicle_specs["rho"], self.vehicle_specs["A_f"], self.vehicle_specs["A_r"], self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+            delta_Fz = compute_load_transfer(h, L, mass, accel_x_approx)
+            F_zf, F_zr = compute_normal_forces(lf, lr, L, mass, g, delta_Fz, F_downforce_f, F_downforce_r)
+            
+            Ffy_max = sys_param_dict["Df"] * F_zf / (mass * g * lr / L)
+            Fry_max = sys_param_dict["Dr"] * F_zr / (mass * g * lf / L)
+
+            alphaf = steering - torch.atan2(lf * yaw_rate + vy, torch.abs(vx)) + sys_param_dict["Shf"]
+            alphar = torch.atan2((lr * yaw_rate - vy), torch.abs(vx)) + sys_param_dict["Shr"]
+            
+            Frx = (sys_param_dict["Cm1"] - sys_param_dict["Cm2"] * vx) * throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"] * (vx**2)
+            Ffy = sys_param_dict["Svf"] + Ffy_max * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+            Fry = sys_param_dict["Svr"] + Fry_max * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+            
+            dvx = 1/mass * (Frx - Ffy*torch.sin(steering)) + vy * yaw_rate
+            dvy = 1/mass * (Fry + Ffy*torch.cos(steering)) - vx * yaw_rate
+            dyaw = 1/Iz * (Ffy * lf * torch.cos(steering) - Fry * lr)
+            
+            vx = vx + dvx * dt
+            vy = vy + dvy * dt
+            yaw_rate = yaw_rate + dyaw * dt
+
+        return torch.stack([vx, vy, yaw_rate], dim=1)
 
 
 class DeepPacejkaModel(ModelBase):
@@ -457,40 +467,51 @@ class DeepDynamicsPCNNPINN(ModelBase):
         steering = state_action_dict["STEERING_FB"] + state_action_dict["STEERING_CMD"]
         throttle = state_action_dict["THROTTLE_FB"] + state_action_dict["THROTTLE_CMD"]
         
-        # Explicit Physics Additions: Load Transfer + Aero Downforce
-        accel_x_approx = (throttle * sys_param_dict["Cm1"] - sys_param_dict["Cr0"]) / self.vehicle_specs["mass"]
-        F_downforce_f, F_downforce_r = compute_aero_forces(
-            state_action_dict["VX"], state_action_dict["VY"], self.vehicle_specs["rho"],
-            self.vehicle_specs["A_f"], self.vehicle_specs["A_r"],
-            self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"]
-        )
-        delta_Fz = compute_load_transfer(
-            self.vehicle_specs["h"], self.vehicle_specs["L"], 
-            self.vehicle_specs["mass"], accel_x_approx
-        )
-        F_zf, F_zr = compute_normal_forces(
-            self.vehicle_specs["lf"], self.vehicle_specs["lr"],
-            self.vehicle_specs["L"], self.vehicle_specs["mass"],
-            self.vehicle_specs["g"], delta_Fz, F_downforce_f, F_downforce_r
-        )
+        # Pull initial kinematic states at the start of the timestep
+        vx = state_action_dict["VX"].clone()
+        vy = state_action_dict["VY"].clone()
+        yaw_rate = state_action_dict["YAW_RATE"].clone()
         
-        # The Peak Friction parameters are explicitly scaled by load transfers prior to the tire curve calculations
-        Ffy_max = sys_param_dict["Df"] * F_zf / (self.vehicle_specs["mass"] * self.vehicle_specs["g"] * self.vehicle_specs["lr"] / self.vehicle_specs["L"])
-        Fry_max = sys_param_dict["Dr"] * F_zr / (self.vehicle_specs["mass"] * self.vehicle_specs["g"] * self.vehicle_specs["lf"] / self.vehicle_specs["L"])
+        # 100x internal micro-stepping for geometric accuracy (cut back for GPU performance)
+        steps = 100 if not self.training else 1
+        dt = Ts / steps
         
-        alphaf = steering - torch.atan2(self.vehicle_specs["lf"]*state_action_dict["YAW_RATE"] + state_action_dict["VY"], torch.abs(state_action_dict["VX"])) + sys_param_dict["Shf"]
-        alphar = torch.atan2((self.vehicle_specs["lr"]*state_action_dict["YAW_RATE"] - state_action_dict["VY"]), torch.abs(state_action_dict["VX"])) + sys_param_dict["Shr"]
+        # Constant vehicle specs across the timestep
+        mass = self.vehicle_specs["mass"]
+        lf = self.vehicle_specs["lf"]
+        lr = self.vehicle_specs["lr"]
+        L = self.vehicle_specs["L"]
+        g = self.vehicle_specs["g"]
+        h = self.vehicle_specs["h"]
+        Iz = sys_param_dict["Iz"]
         
-        Frx = (sys_param_dict["Cm1"]-sys_param_dict["Cm2"]*state_action_dict["VX"])*throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"]*(state_action_dict["VX"]**2)
-        Ffy = sys_param_dict["Svf"] + Ffy_max * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
-        Fry = sys_param_dict["Svr"] + Fry_max * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
-        
-        dxdt = torch.zeros(len(x), 3).to(device)
-        dxdt[:,0] = 1/self.vehicle_specs["mass"] * (Frx - Ffy*torch.sin(steering)) + state_action_dict["VY"]*state_action_dict["YAW_RATE"]
-        dxdt[:,1] = 1/self.vehicle_specs["mass"] * (Fry + Ffy*torch.cos(steering)) - state_action_dict["VX"]*state_action_dict["YAW_RATE"]
-        dxdt[:,2] = 1/sys_param_dict["Iz"] * (Ffy*self.vehicle_specs["lf"]*torch.cos(steering) - Fry*self.vehicle_specs["lr"])
-        dxdt *= Ts
-        return x[:,-1,:3] + dxdt
+        for _ in range(steps):
+            # Explicit Physics Additions: Load Transfer + Aero Downforce
+            accel_x_approx = (throttle * sys_param_dict["Cm1"] - sys_param_dict["Cr0"]) / mass
+            F_downforce_f, F_downforce_r = compute_aero_forces(vx, vy, self.vehicle_specs["rho"], self.vehicle_specs["A_f"], self.vehicle_specs["A_r"], self.vehicle_specs["C_lf"], self.vehicle_specs["C_lr"])
+            delta_Fz = compute_load_transfer(h, L, mass, accel_x_approx)
+            F_zf, F_zr = compute_normal_forces(lf, lr, L, mass, g, delta_Fz, F_downforce_f, F_downforce_r)
+            
+            # The Peak Friction parameters are explicitly scaled by load transfers prior to the tire curve calculations
+            Ffy_max = sys_param_dict["Df"] * F_zf / (mass * g * lr / L)
+            Fry_max = sys_param_dict["Dr"] * F_zr / (mass * g * lf / L)
+            
+            alphaf = steering - torch.atan2(lf * yaw_rate + vy, torch.abs(vx)) + sys_param_dict["Shf"]
+            alphar = torch.atan2((lr * yaw_rate - vy), torch.abs(vx)) + sys_param_dict["Shr"]
+            
+            Frx = (sys_param_dict["Cm1"] - sys_param_dict["Cm2"] * vx) * throttle - sys_param_dict["Cr0"] - sys_param_dict["Cr2"] * (vx**2)
+            Ffy = sys_param_dict["Svf"] + Ffy_max * torch.sin(sys_param_dict["Cf"] * torch.atan(sys_param_dict["Bf"] * alphaf - sys_param_dict["Ef"] * (sys_param_dict["Bf"] * alphaf - torch.atan(sys_param_dict["Bf"] * alphaf))))
+            Fry = sys_param_dict["Svr"] + Fry_max * torch.sin(sys_param_dict["Cr"] * torch.atan(sys_param_dict["Br"] * alphar - sys_param_dict["Er"] * (sys_param_dict["Br"] * alphar - torch.atan(sys_param_dict["Br"] * alphar))))
+            
+            dvx = 1/mass * (Frx - Ffy*torch.sin(steering)) + vy * yaw_rate
+            dvy = 1/mass * (Fry + Ffy*torch.cos(steering)) - vx * yaw_rate
+            dyaw = 1/Iz * (Ffy * lf * torch.cos(steering) - Fry * lr)
+            
+            vx = vx + dvx * dt
+            vy = vy + dvy * dt
+            yaw_rate = yaw_rate + dyaw * dt
+            
+        return torch.stack([vx, vy, yaw_rate], dim=1)
 
     def physics_residual(self, x, output, Ts=0.02):
         """
@@ -533,13 +554,25 @@ class DeepDynamicsPCNNPINN(ModelBase):
         return lasso_loss
 
 
+class DeepDynamicsPCNNPINNMultiStep(DeepDynamicsPCNNPINN):
+    """Multi-Step Trajectory Consistency Hybrid Architecture.
+    Inherits all base physical structure but was trained using sequential 
+    N-step trajectory rollouts to heavily suppress cumulative drift.
+    """
+    def __init__(self, param_dict, eval=False):
+        super().__init__(param_dict, eval)
+        self.trajectory_steps = param_dict["MODEL"].get("TRAJECTORY_STEPS", 10)
+        self.trajectory_weight = param_dict["MODEL"]["OPTIMIZATION"].get("TRAJECTORY_LOSS_WEIGHT", 1.0)
+
+
 string_to_model = {
     "DeepDynamics" : DeepDynamicsModel,
     "DeepPacejka" : DeepPacejkaModel,
     "DeepDynamicsIAC" : DeepDynamicsModelIAC,
     "DeepPacejkaIAC" : DeepPacejkaModelIAC,
     "DeepDynamicsPINN" : DeepDynamicsPINN,
-    "DeepDynamicsPCNNPINN" : DeepDynamicsPCNNPINN
+    "DeepDynamicsPCNNPINN" : DeepDynamicsPCNNPINN,
+    "DeepDynamicsPCNNPINNMultiStep": DeepDynamicsPCNNPINNMultiStep
 }
 
 string_to_dataset = {
@@ -548,5 +581,6 @@ string_to_dataset = {
     "DeepDynamicsIAC" : DeepDynamicsDataset,
     "DeepPacejkaIAC" : DeepPacejkaDataset,
     "DeepDynamicsPINN" : DeepDynamicsDataset,
-    "DeepDynamicsPCNNPINN" : DeepDynamicsDataset
+    "DeepDynamicsPCNNPINN" : DeepDynamicsDataset,
+    "DeepDynamicsPCNNPINNMultiStep": DeepDynamicsDataset
 }

@@ -1,0 +1,20 @@
+INFO:     Started server process [80607]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:61855 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61855 - "GET /api/trajectories?car=INDY&track=PUTNAM_2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61861 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61862 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61862 - "GET /static/styles.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61863 - "GET /static/app.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61862 - "GET /api/trajectories?car=INDY&track=PUTNAM_2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61872 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61872 - "GET /static/app.js HTTP/1.1" 304 Not Modified
+INFO:     127.0.0.1:61872 - "GET /api/trajectories?car=INDY&track=PUTNAM_2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61882 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61882 - "GET /static/app.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61882 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61882 - "GET /static/app.js HTTP/1.1" 304 Not Modified
+INFO:     127.0.0.1:61882 - "GET /api/trajectories?car=INDY&track=PUTNAM_2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61886 - "GET /api/trajectories?car=INDY&track=VEGAS_B HTTP/1.1" 200 OK

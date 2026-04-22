@@ -30,9 +30,9 @@
                 <section class="control-block">
                     <label>location / track</label>
                     <select id="track-select">
+                        <option value="PUTNAM_2">Putnam Park</option>
                         <option value="VEGAS_A">Las Vegas (Run A)</option>
                         <option value="VEGAS_B">Las Vegas (Run B)</option>
-                        <option value="PUTNAM_2">Putnam Park</option>
                         <option value="ETHZ_MOBIL">ETH Zurich</option>
                     </select>
                 </section>
@@ -40,15 +40,19 @@
                 <section class="control-block">
                     <label>simulation timeline slice</label>
                     <div class="slider-container">
-                        <input type="range" id="time-start" min="0" max="100" value="10">
+                        <input type="range" id="time-start" min="0" max="100" value="0">
                     </div>
-                    <div class="slider-labels" style="align-items: center;">
-                        <span id="start-val">10%</span>
+                    <div class="slider-labels" style="align-items: center; margin-bottom: 0.5rem;">
+                        <span id="start-val">0%</span>
                         <div style="display:flex; align-items:center; gap:0.3rem;">
                             <span style="color:var(--border);">+</span>
                             <input type="number" id="window-size" value="2" min="1" max="100" class="minimal-input">
                             <span style="color:var(--border);">% window</span>
                         </div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.5rem;">
+                        <input type="checkbox" id="force-gps-phi" checked>
+                        <label for="force-gps-phi" style="margin:0; font-size:0.8rem; text-transform:none; letter-spacing:normal;">Force GPS Heading (Isolate Vx/Vy)</label>
                     </div>
                 </section>
 
