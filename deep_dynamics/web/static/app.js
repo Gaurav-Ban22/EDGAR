@@ -60,19 +60,49 @@ function initChart() {
     });
 }
 
-function integrateTrajectory(vx, vy, yaw_rate, dt, x0, y0, phi0) {
+/**
+ * Integrate body-frame velocities into global XY trajectory.
+ * 
+ * FIX: Uses GPS heading (phi) from the aligned poses array at each step
+ * instead of integrating yaw_rate. This eliminates cumulative heading
+ * drift which was causing 50-83m position error over 120s.
+ * 
+ * @param {number[]} vx - longitudinal velocity (m/s)
+ * @param {number[]} vy - lateral velocity (m/s)  
+ * @param {number[]} yaw_rate - yaw rate (rad/s) - unused now, kept for API compat
+ * @param {number} dt - timestep (s)
+ * @param {number} x0 - initial x position
+ * @param {number} y0 - initial y position
+ * @param {number} phi0 - initial heading
+ * @param {number[]} gps_phi - GPS heading at each step (from aligned poses array)
+ * @param {number} gps_phi_offset - index offset into gps_phi array
+ */
+function integrateTrajectory(vx, vy, yaw_rate, dt, x0, y0, phi0, gps_phi, gps_phi_offset) {
     const n = vx.length;
     const path = [];
     let curr_x = x0;
     let curr_y = y0;
     let curr_phi = phi0;
+    const useGpsPhi = gps_phi && gps_phi.length > 0;
     
     path.push({x: curr_x, y: curr_y});
     
     for (let i = 0; i < n; i++) {
         if (isNaN(vx[i]) || isNaN(vy[i]) || isNaN(yaw_rate[i])) break;
         
-        let next_phi = curr_phi + yaw_rate[i] * dt;
+        // Use GPS heading if available — this prevents cumulative yaw drift
+        if (useGpsPhi) {
+            let phiIdx = gps_phi_offset + i;
+            if (phiIdx >= 0 && phiIdx < gps_phi.length) {
+                curr_phi = gps_phi[phiIdx];
+            } else {
+                // Fall back to yaw_rate integration if past GPS data
+                curr_phi = curr_phi + yaw_rate[i] * dt;
+            }
+        } else {
+            curr_phi = curr_phi + yaw_rate[i] * dt;
+        }
+
         let next_x = curr_x + (vx[i] * Math.cos(curr_phi) - vy[i] * Math.sin(curr_phi)) * dt;
         let next_y = curr_y + (vx[i] * Math.sin(curr_phi) + vy[i] * Math.cos(curr_phi)) * dt;
         
@@ -85,7 +115,7 @@ function integrateTrajectory(vx, vy, yaw_rate, dt, x0, y0, phi0) {
         }
 
         path.push({x: next_x, y: next_y});
-        curr_x = next_x; curr_y = next_y; curr_phi = next_phi;
+        curr_x = next_x; curr_y = next_y;
     }
     return path;
 }
@@ -103,13 +133,20 @@ function updateChartSlice() {
 
     const datasets = [];
     
-    // Total dataset bounds based *strictly* on physics model length (not raw CSV)
-    const max_N = currentRawData.ground_truth.vx.length + 5;
+    // The horizon offset: NPZ labels[i] corresponds to poses[i + horizon]
+    // where horizon = 5. So model/GT sample i maps to GPS pose at i + 5.
+    const HORIZON = 5;
     
-    // Safety clamp just in case sizes exceed the map
-    const globalStart = Math.floor((startPercent / 100) * max_N);
-    let potentialEnd = Math.floor((endPercent / 100) * max_N);
-    const globalEnd = Math.min(max_N, potentialEnd);
+    // Total dataset bounds based on model/GT length
+    const gt_len = currentRawData.ground_truth.vx.length;
+    
+    const globalStart = Math.floor((startPercent / 100) * gt_len);
+    let potentialEnd = Math.floor((endPercent / 100) * gt_len);
+    const globalEnd = Math.min(gt_len, potentialEnd);
+    
+    // The GPS poses are aligned with the NPZ data.
+    // poses[i + HORIZON] corresponds to model/GT sample i.
+    // So for model sample globalStart, the GPS position is at gps index (globalStart + HORIZON).
     
     // 1. Draw the entire GPS Track as a background map
     if (currentRawData.gps.x.length > 0) {
@@ -129,11 +166,12 @@ function updateChartSlice() {
         }
         datasets.push(cachedBackgroundDataset);
         
+        // Active GPS region — use aligned indices
+        const gpsActiveStart = globalStart + HORIZON;
+        const gpsActiveEnd = Math.min(currentRawData.gps.x.length, globalEnd + HORIZON);
         const activeGpsData = [];
-        for(let i = globalStart; i < globalEnd; i++) {
-            if(i < currentRawData.gps.x.length) {
-                activeGpsData.push({x: currentRawData.gps.x[i], y: currentRawData.gps.y[i]});
-            }
+        for(let i = gpsActiveStart; i < gpsActiveEnd; i++) {
+            activeGpsData.push({x: currentRawData.gps.x[i], y: currentRawData.gps.y[i]});
         }
         datasets.push({
             label: 'Active GPS Region',
@@ -145,17 +183,13 @@ function updateChartSlice() {
         });
     }
 
-    // Models start 5 indexes behind GPS due to horizon delay
-    const m_start = Math.max(0, globalStart - 5);
-    const m_end = Math.max(0, globalEnd - 5);
-    
+    // Initial position from GPS at the aligned index
     let x0 = 0.0, y0 = 0.0, phi0 = 0.0;
-    if (currentRawData.gps.x.length > 0) {
-        let exactIdx = m_start + 5;
-        if (exactIdx >= currentRawData.gps.x.length) exactIdx = currentRawData.gps.x.length - 1;
-        x0 = currentRawData.gps.x[exactIdx];
-        y0 = currentRawData.gps.y[exactIdx];
-        phi0 = currentRawData.gps.phi[exactIdx];
+    const gpsStartIdx = globalStart + HORIZON;
+    if (currentRawData.gps.x.length > 0 && gpsStartIdx < currentRawData.gps.x.length) {
+        x0 = currentRawData.gps.x[gpsStartIdx];
+        y0 = currentRawData.gps.y[gpsStartIdx];
+        phi0 = currentRawData.gps.phi[gpsStartIdx];
     }
     
     // Get Toggle states
@@ -166,12 +200,13 @@ function updateChartSlice() {
     });
 
     if (checkedNames.has(currentRawData.ground_truth.name)) {
-        let gt_vx = currentRawData.ground_truth.vx.slice(m_start, m_end);
-        let gt_vy = currentRawData.ground_truth.vy.slice(m_start, m_end);
-        let gt_yaw = currentRawData.ground_truth.yaw_rate.slice(m_start, m_end);
+        let gt_vx = currentRawData.ground_truth.vx.slice(globalStart, globalEnd);
+        let gt_vy = currentRawData.ground_truth.vy.slice(globalStart, globalEnd);
+        let gt_yaw = currentRawData.ground_truth.yaw_rate.slice(globalStart, globalEnd);
         datasets.push({
             label: currentRawData.ground_truth.name,
-            data: integrateTrajectory(gt_vx, gt_vy, gt_yaw, 0.04, x0, y0, phi0),
+            data: integrateTrajectory(gt_vx, gt_vy, gt_yaw, 0.04, x0, y0, phi0,
+                                      currentRawData.gps.phi, gpsStartIdx),
             borderColor: '#111',
             borderDash: [5, 5],
             borderWidth: 2,
@@ -181,12 +216,13 @@ function updateChartSlice() {
 
     currentRawData.models.forEach(m => {
         if (checkedNames.has(m.name)) {
-            let m_vx = m.vx.slice(m_start, m_end);
-            let m_vy = m.vy.slice(m_start, m_end);
-            let m_yaw = m.yaw_rate.slice(m_start, m_end);
+            let m_vx = m.vx.slice(globalStart, globalEnd);
+            let m_vy = m.vy.slice(globalStart, globalEnd);
+            let m_yaw = m.yaw_rate.slice(globalStart, globalEnd);
             datasets.push({
                 label: m.name,
-                data: integrateTrajectory(m_vx, m_vy, m_yaw, 0.04, x0, y0, phi0),
+                data: integrateTrajectory(m_vx, m_vy, m_yaw, 0.04, x0, y0, phi0,
+                                          null, 0),
                 borderColor: m.color,
                 borderWidth: 2,
                 order: 1
@@ -233,7 +269,6 @@ async function fetchTrajectories() {
         if (!response.ok) throw new Error("Failed to fetch");
         currentRawData = await response.json();
         
-        let allX = currentRawData.gps.x.length > 0 ? currentRawData.gps.x : currentRawData.ground_truth.vx; 
         if (currentRawData.gps.x.length > 0) {
             let minX = Math.min(...currentRawData.gps.x);
             let maxX = Math.max(...currentRawData.gps.x);

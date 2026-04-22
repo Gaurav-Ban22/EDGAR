@@ -28,19 +28,15 @@ def read_index():
 # ----------------- Data Mappings -----------------
 TRACKS = {
     "VEGAS_A": {
-        "csv": "LVMS_23_01_04_A.csv",
         "npz": "LVMS_23_01_04_A_5.npz"
     },
     "VEGAS_B": {
-        "csv": "LVMS_23_01_04_B.csv",
         "npz": "LVMS_23_01_04_B_5.npz"
     },
     "PUTNAM_2": {
-        "csv": "Putnam_park2023_run2_1.csv",
         "npz": "Putnam_park2023_run2_1_5.npz"
     },
     "ETHZ_MOBIL": {
-        "csv": None,
         "npz": "DYN-PP-ETHZMobil_5.npz"
     }
 }
@@ -95,19 +91,6 @@ def get_latest_checkpoint(checkpoint_dir):
     ch.sort(key=lambda x: int(os.path.basename(x).split("_")[1].split(".")[0]))
     return ch[-1]
 
-def integrate_trajectory(vx, vy, yaw_rate, dt=0.04, x0=0.0, y0=0.0, phi0=0.0):
-    # Keeping this inside server.py just in case, but no longer used in /api/trajectories
-    n = len(vx)
-    x = np.zeros(n + 1)
-    y = np.zeros(n + 1)
-    phi = np.zeros(n + 1)
-    x[0], y[0], phi[0] = x0, y0, phi0
-    for i in range(n):
-        phi[i + 1] = phi[i] + yaw_rate[i] * dt
-        x[i + 1] = x[i] + (vx[i] * np.cos(phi[i]) - vy[i] * np.sin(phi[i])) * dt
-        y[i + 1] = y[i] + (vx[i] * np.sin(phi[i]) + vy[i] * np.cos(phi[i])) * dt
-    return x[1:], y[1:]
-
 @app.get("/api/trajectories")
 def get_trajectories(car: str, track: str):
     cache_key = f"{car}_{track}"
@@ -128,22 +111,32 @@ def get_trajectories(car: str, track: str):
     if not os.path.exists(npz_path):
         raise HTTPException(status_code=500, detail=f"Dataset {npz_path} not found. Must parse first.")
         
-    gps_x, gps_y, gps_phi = [], [], []
-    x0, y0, phi0 = 0.0, 0.0, 0.0
-    
-    if TRACKS[track]["csv"] is not None:
-        csv_path = os.path.join(BASE, "deep_dynamics/data", TRACKS[track]["csv"])
-        df = pd.read_csv(csv_path, comment="#", header=None)
-        gps_x_raw = df.iloc[:, 1].values
-        gps_y_raw = df.iloc[:, 2].values
-        gps_phi_raw = df.iloc[:, 5].values
-        
-        gps_x = gps_x_raw.tolist()
-        gps_y = gps_y_raw.tolist()
-        gps_phi = gps_phi_raw.tolist()
-    
-    data_npy = np.load(npz_path)
+    data_npy = np.load(npz_path, allow_pickle=True)
     features, labels = data_npy["features"], data_npy["labels"]
+    
+    # --- FIX #1: Use the POSES array from NPZ for GPS data ---
+    # The poses array is aligned with the NPZ indices (filtered data).
+    # Previously we read GPS from the raw CSV which has a completely different
+    # number of rows (e.g. VEGAS_A: 39,811 CSV rows vs 13,414 NPZ rows).
+    # poses[i] = [x, y, phi, vx, vy, vtheta, throttle, steering]
+    gps_x, gps_y, gps_phi = [], [], []
+    if "poses" in data_npy.files:
+        poses = data_npy["poses"]
+        gps_x = poses[:, 0].tolist()
+        gps_y = poses[:, 1].tolist()
+        gps_phi = poses[:, 2].tolist()
+    
+    # --- FIX #2: Trim trailing zero labels ---
+    # The CSV parser allocates N entries but only fills N-5, leaving 5 zero labels.
+    # Find and trim them so they don't corrupt the trajectory.
+    num_valid = len(labels)
+    for i in range(len(labels) - 1, -1, -1):
+        if np.all(labels[i] == 0):
+            num_valid = i
+        else:
+            break
+    features = features[:num_valid]
+    labels = labels[:num_valid]
     
     response_data = {
         "gps": {
@@ -213,3 +206,7 @@ def get_trajectories(car: str, track: str):
     # Cache result
     trajectory_cache[cache_key] = response_data
     return response_data
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
