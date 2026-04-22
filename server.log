@@ -18,3 +18,8 @@ INFO:     127.0.0.1:61882 - "GET / HTTP/1.1" 200 OK
 INFO:     127.0.0.1:61882 - "GET /static/app.js HTTP/1.1" 304 Not Modified
 INFO:     127.0.0.1:61882 - "GET /api/trajectories?car=INDY&track=PUTNAM_2 HTTP/1.1" 200 OK
 INFO:     127.0.0.1:61886 - "GET /api/trajectories?car=INDY&track=VEGAS_B HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61896 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61896 - "GET /static/styles.css HTTP/1.1" 304 Not Modified
+INFO:     127.0.0.1:61897 - "GET /static/app.js HTTP/1.1" 304 Not Modified
+INFO:     127.0.0.1:61902 - "GET /api/trajectories?car=RC&track=PUTNAM_2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61906 - "GET /api/trajectories?car=INDY&track=PUTNAM_2 HTTP/1.1" 200 OK
