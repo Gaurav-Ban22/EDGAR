@@ -4,6 +4,12 @@
 # =============================================================================
 
 # --- Dynamics model (Deep Dynamics checkpoint + training YAML) ---
+# LVMS RL uses the IAC model (`DeepDynamicsIAC` in deep_dynamics_iac.yaml).
+# Paths are relative to this file's directory (`rl/configs/`); they resolve to
+#   deep_dynamics/cfgs/model/deep_dynamics_iac.yaml
+#   deep_dynamics/output/deep_dynamics_iac/<experiment>/epoch_*.pth
+# (ORCA-scale `DeepDynamics` + deep_dynamics.yaml is for MPC/visualize; train
+#  with deep_dynamics/model/train.py if you need weights under output/deep_dynamics/.)
 dynamics:
   model_config_path: ../../cfgs/model/deep_dynamics_iac.yaml
   checkpoint_path: ../../output/deep_dynamics_iac/my_experiment_name/epoch_82.pth
@@ -15,36 +21,163 @@ track:
   track_dir: ../../visualize/tracks
   track_name: lvms
 
+# --- Raceline (expert reference extracted from real IAC telemetry) ---
+# When enabled, all Frenet-frame quantities (d, heading_err, s, progress,
+# overspeed) and the curvature lookahead in the observation are computed
+# against this curve instead of the geometric centerline. It's the
+# fastest *full* lap in the specified CSV, smoothed + resampled.
+#
+# This serves two purposes:
+#   1. Reward shaping targets the actual racing line, not centerline
+#      (centerline is a bad line on an oval — wide, not apex-hugging).
+#   2. Keeps the agent inside the Deep Dynamics training distribution,
+#      mitigating model exploitation / compounding prediction error.
+raceline:
+  enabled: true
+  csv: ../../data/LVMS_23_01_04_A.csv
+  use_vx_profile: true       # vx_ref(s) comes from measured speed profile
+  smooth_xy: 15              # samples; 15 @ 25Hz ≈ 0.6s window
+  smooth_vx: 25              # samples
+  resample_ds: 2.0           # m between raceline vertices
+  min_lap_coverage: 0.90     # lap must span ≥ 90% of track length
+
 # --- Environment ---
+# curvature_lookahead_distances (metres): explicit non-uniform grid along
+# the reference curve. Short entries give local detail for micro-corrections;
+# long entries let the agent brake *early* for the next corner — per
+# "Formula RL" (Remonda et al. 2019), long-horizon curvature perception was
+# the single biggest observation-space change that unlocked faster lap times.
+# For IAC speeds (~50 m/s top) we scale their TORCS grid [20,40,60,80] up.
+# Length of this list sets n_curvature_points (here: 8, so obs_dim = 27 with
+# raceline enabled). If you remove this key the legacy spacing×count grid
+# is used instead.
 env:
   max_steps: 5000
-  initial_speed: 15.0
-  n_curvature_points: 10
-  curvature_lookahead_spacing: 5.0
+  # IAC raceline mean vx ≈ 50 m/s. Spawning at 25 m/s means the agent
+  # doesn't find 15 m/s straight-line cruise to be a comfortable local
+  # optimum — acceleration is still rewarded, but deceleration no longer
+  # lands on a "safe" speed far below race pace.
+  initial_speed: 25.0
+  # For random starts, initialize near the local speed target instead of using
+  # one fixed vx everywhere. This avoids starting too fast in sharp turns and
+  # too slow on straights.
+  initial_speed_from_reference: true
+  initial_speed_scale: 0.75
+  initial_speed_min: 20.0
+  initial_speed_max: 30.0
+  curvature_lookahead_distances: [20.0, 40.0, 60.0, 80.0, 120.0, 160.0, 200.0, 250.0]
   boundary_margin: 0.0
+  # SAC is very sensitive to input scale. Raw observations mix ~50 m/s speed
+  # references with ~0.004 1/m curvatures and ~0.003 command deltas, which
+  # saturates a freshly initialized tanh actor and prevents stable learning.
+  normalize_observations: true
+  obs_clip: 10.0
+  # "Stuck" = vx below threshold for N consecutive steps, then terminate with
+  # stuck_penalty. Raised to 200 so an episode where the agent briefly over-
+  # corrects and dips under 1 m/s doesn't get killed — otherwise the buffer
+  # fills with tiny failed episodes and the policy never sees any recovery
+  # dynamics. At 25 Hz (Ts=0.04s), 200 steps = 8 s of sub-1-m/s driving.
   stuck_vx_threshold: 1.0
-  stuck_steps_threshold: 50
+  stuck_steps_threshold: 200
 
 # --- Action bounds ---
-# CRITICAL: must match the Deep Dynamics training data distribution.
+# Bounds must match the Deep Dynamics training data distribution.
 # scaler.pkl shows throttle_cmd std≈0.004, steering_cmd std≈0.0004.
-# These bounds cover ~3× the std — wide enough to explore, narrow enough
-# to keep the dynamics model in-distribution.
+#
+# Throttle remains slightly positive-biased, but braking authority must be
+# comparable to acceleration authority. The previous [-0.008, 0.032] made it
+# easy to build speed and too slow to unwind throttle before the sharp turns.
+#
+# Widened vs the original [-0.015, +0.015]:
+#   * steering: ±0.0015 → ±0.003 (2×). The original gave a max steering
+#     rate of 0.0375/s — not enough authority to execute a decisive
+#     turn-in at 30 m/s (corners need ≈0.1 steering_fb in ~1 s). 2×
+#     doubles the turn-in rate while staying at ~7.5× the training-data
+#     std — still within the dynamics model's extrapolation envelope.
+#   * throttle: stronger negative command lets the accumulated throttle_fb
+#     come down before corner entry while keeping a small +0.004 default bias.
+#
+# Keep these conservative — going much wider risks the dynamics model
+# drifting out-of-distribution, which breaks the simulator.
 action:
-  throttle_cmd_range: [-0.015, 0.015]
-  steering_cmd_range: [-0.0015, 0.0015]
+  throttle_cmd_range: [-0.060, 0.035]
+  steering_cmd_range: [-0.004, 0.004]
+  throttle_fb_range: [-0.15, 1.00]
+  steering_fb_range: [-0.030, 0.035]
 
 # --- Reward ---
+# Two modes are supported:
+#
+#   mode: formula_rl   (default, recommended)
+#     Hybrid of Remonda et al. 2019 "Formula RL" + additive progress:
+#       r_coupling = vx * ( cos(h_err) − |sin(h_err)| − clamp(|d|/d_ref, 0, 1) )
+#       r_progress = alpha_progress * (Δs / Ts)        # additive
+#       r_lateral  = -alpha_d * d_penalty_quad_linear  # additive, NOT vx-scaled
+#     The coupling term preserves the paper's key insight (fast-AND-accurate
+#     earns the most). The additive terms fix two concrete failure modes
+#     we observed with the pure paper form:
+#       (a) "brake to escape off-line penalty"  — with the original
+#           unbounded −vx·|d|/d_ref term, slowing down reduced the
+#           negative reward. Clamping |d|/d_ref at 1 and making the
+#           lateral cost speed-independent closes that loophole.
+#       (b) "straight-line cruise at initial_speed"  — the coupling
+#           term alone peaks at ~vx on-line, so exploration transients
+#           (any wobble) cost proportional to vx, discouraging speed.
+#           The additive Δs/Ts term gives a strict gradient toward
+#           forward motion regardless of transient heading errors.
+#
+#   mode: balanced
+#     Legacy additive scheme: r_progress + r_lateral + r_heading + aux.
+#     r_lateral is quadratic inside [−d_cap, d_cap] and LINEAR beyond
+#     (slope 2·alpha_d·d_cap), so the gradient never vanishes far from
+#     the line — this fixes the bug where the old capped-quadratic left
+#     an agent with no pull-back incentive once |d| > d_cap.
+#
+# Reference frame (either mode): with raceline enabled, d/h_err/Δs/vx_ref
+# are all measured against the expert trajectory from telemetry, not the
+# geometric centreline.
 reward:
-  alpha_d: 0.1
-  alpha_h: 0.5
-  alpha_a: 0.01
-  alpha_v: 0.0
-  vx_max: 50.0            # m/s — penalize above this (scaler 3σ upper bound)
-  alpha_overspeed: 1.0     # quadratic penalty weight for vx > vx_max
-  crash_penalty: 100.0
+  mode: formula_rl           # formula_rl | balanced
+  d_ref: 1.0                 # m — formula_rl: lateral-cost normalisation
+
+  # --- used by BOTH modes (additive progress + additive lateral in
+  #     formula_rl; primary signal in balanced). alpha_h / alpha_v are
+  #     balanced-only.
+  alpha_progress: 1.0        # weight on additive Δs/Ts term
+  alpha_d: 0.5               # weight on additive quad-linear lateral penalty
+  d_cap: 8.0                 # m — quadratic inside, linear outside (no saturation)
+  alpha_h: 0.5               # balanced only
+  alpha_v: 0.0               # balanced only (flat speed bonus — unused)
+
+  # --- shared aux terms (applied in both modes) ---
+  alpha_a: 0.01              # action-rate smoothness
+  alpha_slip: 2.0            # sideslip-angle penalty weight
+  alpha_steerspeed: 0.05     # vx * steering_fb^2
+  alpha_underspeed: 0.05     # squared penalty for being below speed target
+  underspeed_tolerance: 5.0  # m/s slack before underspeed penalty starts
+
+  # Speed ceiling. Use the minimum of the telemetry vx(s) profile and a
+  # conservative curvature-derived limit. Also apply the overspeed penalty
+  # against a braking-distance envelope: far from a corner the car may run
+  # fast, but as braking distance shrinks it must approach the corner target.
+  use_curvature_vxmax: true
+  use_curvature_vx_ref: true
+  use_lookahead_overspeed: true
+  overspeed_lookahead_max_distance: 250.0
+  braking_decel: 5.0         # m/s^2 assumed comfortable decel for speed envelope
+  vx_max: 75.0               # absolute cap on v_ref (IAC top speed region)
+  a_lat_max: 3.2             # m/s^2 — sharp turns target ~25 m/s
+  kappa_min: 1.5e-3          # 1/m floor; straights still allow ~46 m/s
+  alpha_overspeed: 3.0       # squared penalty for being above speed target
+
+  # Terminal (fired once when the episode ends).
+  # crash_penalty lowered 200 → 75: per-step reward is ~30 on-line at 30 m/s,
+  # so 200 was worth ~7 good steps of driving. That's a huge variance hit
+  # on SAC's Q-target whenever a crash happens. 75 still strongly discourages
+  # boundary hits without dominating the gradient signal.
+  crash_penalty: 75.0
   stuck_penalty: 50.0
-  lap_bonus: 0.0
+  lap_bonus: 100.0           # completing a lap should dominate raw progress
 
 # --- SAC ---
 sac:
@@ -55,9 +188,18 @@ sac:
   tau: 0.005
   batch_size: 256
   buffer_size: 1000000
-  initial_random_steps: 10000
+  # Dropped 10k → 3k so gradient updates start after ~1 full episode instead
+  # of 2+. Early learning is more important than fully-random buffer coverage
+  # on a continuous-control racing task where most actions are tiny deltas.
+  initial_random_steps: 3000
   target_entropy: -2.0
   hidden_dim: 256
+  max_grad_norm: 1.0
+  # Keep automatic entropy tuning in a sane range. The previous log-prob used
+  # physical action-scale density, so alpha exploded and the actor stayed near
+  # the action midpoint instead of learning steering corrections.
+  log_alpha_min: -10.0
+  log_alpha_max: 5.0
 
 # --- Training loop ---
 training:
@@ -68,5 +210,12 @@ training:
   log_every: 10
   checkpoint_dir: ../../rl_runs/checkpoints
   log_dir: ../../rl_runs/logs
+  # Default SAC policy for evaluate.py / visualize.py when --checkpoint is omitted.
+  # Path is relative to this file (rl/configs/). Use sac_latest.pt after training.
+  sac_policy_checkpoint: ../../rl_runs/checkpoints/sac_latest.pt
   eval_seed: 42
   train_seed: null
+  # evaluate.py: random spawn along centerline each episode (robustness; std>0).
+  eval_randomize_start: true
+  # train.py: new episode starts at random centerline index (coverage).
+  train_randomize_start: true

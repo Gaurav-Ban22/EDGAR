@@ -130,8 +130,10 @@ class GaussianActor(nn.Module):
         squash_corr = torch.log(1.0 - action.pow(2) + 1e-6).sum(
             dim=-1, keepdim=True
         )
-        scale_corr = torch.log(self.action_scale + 1e-8).sum(
-            dim=-1, keepdim=True
-        )
-        log_prob = log_prob_u - squash_corr - scale_corr
+        # SAC's target entropy is specified in normalized tanh-action units.
+        # Including the affine physical-action scale here adds a large constant
+        # when command ranges are tiny (especially steering), which makes
+        # automatic entropy tuning drive alpha upward without improving policy
+        # shape. The constant has no useful actor gradient, so leave it out.
+        log_prob = log_prob_u - squash_corr
         return scaled, log_prob

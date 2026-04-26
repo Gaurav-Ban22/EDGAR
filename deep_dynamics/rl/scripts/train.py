@@ -37,9 +37,11 @@ def run_eval_episode(
     agent: SAC,
     *,
     seed: int,
+    randomize_start: bool = False,
 ) -> Tuple[float, int, float, int]:
     """Return (episode_return, steps, max_vx, terminal_lap_count)."""
-    obs, _ = env.reset(seed=seed)
+    opts = {"randomize_start": True} if randomize_start else None
+    obs, _ = env.reset(seed=seed, options=opts)
     total_r = 0.0
     steps = 0
     max_vx = 0.0
@@ -65,6 +67,8 @@ def train(cfg: RLConfig, *, max_episodes_override: Optional[int] = None) -> None
     log_every = tr["log_every"]
     eval_seed = tr["eval_seed"]
     train_seed = tr["train_seed"]
+    eval_randomize_start = bool(tr.get("eval_randomize_start", False))
+    train_randomize_start = bool(tr.get("train_randomize_start", False))
     batch_size = tr["batch_size"]
     buffer_size = tr["buffer_size"]
     initial_random_steps = tr["initial_random_steps"]
@@ -92,6 +96,7 @@ def train(cfg: RLConfig, *, max_episodes_override: Optional[int] = None) -> None
     logger = TrainLogger(log_root)
 
     total_steps = 0
+    best_high_reward = 30_000.0
     print(
         f"Config: {cfg.path}\n"
         f"Training: max_episodes={int(tr['max_episodes'])}  "
@@ -100,7 +105,15 @@ def train(cfg: RLConfig, *, max_episodes_override: Optional[int] = None) -> None
     )
 
     for episode in range(1, int(tr["max_episodes"]) + 1):
-        obs, _ = env.reset()
+        ep_seed: Optional[int]
+        if train_seed is not None:
+            ep_seed = int(train_seed) + episode
+        else:
+            ep_seed = episode
+        reset_opts = (
+            {"randomize_start": True} if train_randomize_start else None
+        )
+        obs, _ = env.reset(seed=ep_seed, options=reset_opts)
         episode_reward = 0.0
         max_vx = 0.0
         lap_count = 0
@@ -151,8 +164,25 @@ def train(cfg: RLConfig, *, max_episodes_override: Optional[int] = None) -> None
             f"len {ep_len:4d}  laps {lap_count}  max_vx {max_vx:.2f}"
         )
 
+        if episode_reward > best_high_reward:
+            best_high_reward = float(episode_reward)
+            safe_reward = int(round(episode_reward))
+            agent.save(ckpt_root / "sac_best_reward_over_30000.pt")
+            agent.save(
+                ckpt_root / f"sac_best_reward_ep_{episode}_R_{safe_reward}.pt"
+            )
+            print(
+                f"  saved best reward checkpoint  R {episode_reward:.2f}  "
+                f"ep {episode}  len {ep_len}  laps {lap_count}"
+            )
+
         if eval_every > 0 and episode % eval_every == 0:
-            er, es, emv, elaps = run_eval_episode(env, agent, seed=eval_seed)
+            er, es, emv, elaps = run_eval_episode(
+                env,
+                agent,
+                seed=eval_seed,
+                randomize_start=eval_randomize_start,
+            )
             logger.log_scalars(
                 "eval",
                 {

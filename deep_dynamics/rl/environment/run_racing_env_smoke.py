@@ -47,12 +47,19 @@ def _require_file(label: str, path: Path) -> Path:
 def main() -> int:
     epilog = r"""
 Example (run from `EDGAR/` — use the same run directory that contains
-`scaler.pkl` next to your `epoch_*.pth`):
+`scaler.pkl` next to your `epoch_*.pth`; matches default RL config):
 
   python -m deep_dynamics.rl.environment.run_racing_env_smoke \
     --model-config deep_dynamics/cfgs/model/deep_dynamics_iac.yaml \
     --checkpoint deep_dynamics/output/deep_dynamics_iac/my_experiment_name/epoch_82.pth \
     --scaler deep_dynamics/output/deep_dynamics_iac/my_experiment_name/scaler.pkl
+
+  ORCA baseline (`DeepDynamics` + deep_dynamics.yaml), if you have that output tree:
+
+  python -m deep_dynamics.rl.environment.run_racing_env_smoke \
+    --model-config deep_dynamics/cfgs/model/deep_dynamics.yaml \
+    --checkpoint deep_dynamics/output/deep_dynamics/16layers_436neurons_2batch_0.000144lr_5horizon_7gru/epoch_385.pth \
+    --scaler deep_dynamics/output/deep_dynamics/16layers_436neurons_2batch_0.000144lr_5horizon_7gru/scaler.pkl
 """
     p = argparse.ArgumentParser(
         description="RacingEnv smoke test",

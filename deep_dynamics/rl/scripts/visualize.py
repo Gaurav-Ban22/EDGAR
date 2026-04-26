@@ -2,12 +2,13 @@
 """
 Phase 8.2: one rollout + track/trajectory plot (speed-colored) + time series.
 
-From ``EDGAR/``::
+From ``EDGAR/`` (omit ``--checkpoint`` to use ``training.sac_policy_checkpoint``)::
 
     python -m deep_dynamics.rl.scripts.visualize \\
         --config deep_dynamics/rl/configs/default.yaml \\
-        --checkpoint deep_dynamics/rl_runs/checkpoints/sac_latest.pt \\
         --output /tmp/rl_viz.png
+
+    For old SAC checkpoints (20-dim obs), add ``--legacy-policy``.
 """
 
 from __future__ import annotations
@@ -79,17 +80,57 @@ def main() -> int:
     default_cfg = here.parent.parent / "configs" / "default.yaml"
     p = argparse.ArgumentParser(description="Visualize one SAC rollout")
     p.add_argument("--config", type=Path, default=default_cfg)
-    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="SAC sac_*.pt (default: training.sac_policy_checkpoint from config)",
+    )
     p.add_argument("--output", type=Path, default=Path("rl_trajectory.png"))
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Reset seed (default: training.eval_seed). Single rollout.",
+    )
     p.add_argument(
         "--randomize-start",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Random centerline spawn (default: fixed start for a reproducible figure)",
+    )
+    p.add_argument(
+        "--legacy-policy",
         action="store_true",
-        help="Random start on centerline (default: fixed start for reproducible plot)",
+        help="Disable raceline (20-dim obs) for old checkpoints; same as evaluate.",
     )
     args = p.parse_args()
 
-    cfg = load_rl_config(args.config.expanduser().resolve())
+    env_overrides = {"use_raceline": False} if args.legacy_policy else None
+    cfg = load_rl_config(
+        args.config.expanduser().resolve(), env_overrides=env_overrides
+    )
+    viz_seed = (
+        args.seed
+        if args.seed is not None
+        else int(cfg.training.get("eval_seed", 0))
+    )
+    if args.randomize_start is None:
+        randomize_start = False
+    else:
+        randomize_start = bool(args.randomize_start)
+    ckpt = args.checkpoint
+    if ckpt is None:
+        default_ckpt = cfg.training.get("sac_policy_checkpoint")
+        if not default_ckpt:
+            p.error(
+                "No --checkpoint given and config has no training.sac_policy_checkpoint"
+            )
+        ckpt = Path(default_ckpt)
+    ckpt = ckpt.expanduser().resolve()
+    if not ckpt.is_file():
+        p.error(f"checkpoint not found: {ckpt}")
+
     env = RacingEnv(cfg.env)
     agent = SAC(
         env.observation_space.shape[0],
@@ -99,10 +140,10 @@ def main() -> int:
         config=cfg.sac_agent,
         device=cfg.device,
     )
-    agent.load(args.checkpoint.expanduser().resolve(), load_optimizers=False)
+    agent.load(ckpt, load_optimizers=False)
 
     traj = collect_episode(
-        env, agent, seed=args.seed, randomize_start=args.randomize_start
+        env, agent, seed=viz_seed, randomize_start=randomize_start
     )
     t_axis = np.arange(len(traj["vx"])) * float(env.dynamics.Ts)
 

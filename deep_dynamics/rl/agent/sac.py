@@ -59,6 +59,13 @@ class SAC:
         lr_actor = float(cfg.get("lr_actor", 3e-4))
         lr_critic = float(cfg.get("lr_critic", 3e-4))
         lr_alpha = float(cfg.get("lr_alpha", 3e-4))
+        # Global grad-norm clipping for actor/critic/alpha. Prevents the NaN
+        # cascade observed when a large-magnitude reward (e.g. crash_penalty
+        # -200 mixed with per-step rewards +30) produces huge Q-targets and
+        # the critic/actor gradients blow up. 1.0 is the standard SAC value.
+        self.max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
+        self.log_alpha_min = float(cfg.get("log_alpha_min", -10.0))
+        self.log_alpha_max = float(cfg.get("log_alpha_max", 5.0))
         self.target_entropy = cfg.get("target_entropy", None)
         if self.target_entropy is None:
             self.target_entropy = -float(action_dim)
@@ -131,6 +138,9 @@ class SAC:
         loss_q = F.mse_loss(q1, target) + F.mse_loss(q2, target)
         self.optim_critic.zero_grad()
         loss_q.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), self.max_grad_norm
+        )
         self.optim_critic.step()
 
         new_actions, log_pi = self.actor(
@@ -141,12 +151,18 @@ class SAC:
         loss_actor = (self.alpha * log_pi - q_min_online).mean()
         self.optim_actor.zero_grad()
         loss_actor.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), self.max_grad_norm
+        )
         self.optim_actor.step()
 
         loss_alpha = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
         self.optim_alpha.zero_grad()
         loss_alpha.backward()
+        torch.nn.utils.clip_grad_norm_([self.log_alpha], self.max_grad_norm)
         self.optim_alpha.step()
+        with torch.no_grad():
+            self.log_alpha.clamp_(self.log_alpha_min, self.log_alpha_max)
 
         self._soft_update(self.critic, self.critic_target)
 
@@ -195,6 +211,8 @@ class SAC:
             la, dtype=torch.float32, device=self.device
         )
         self.log_alpha.data.copy_(la_t.to(self.device).reshape_as(self.log_alpha.data))
+        with torch.no_grad():
+            self.log_alpha.clamp_(self.log_alpha_min, self.log_alpha_max)
         if load_optimizers:
             self.optim_actor.load_state_dict(ckpt["optim_actor"])
             self.optim_critic.load_state_dict(ckpt["optim_critic"])
